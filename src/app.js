@@ -1,0 +1,2644 @@
+/* ==========================================================================
+   Network Explorer — application source.
+   Built into index.html by `node build.js` (which inlines this file and the
+   demo CSVs). Edit this file, not index.html.
+   ========================================================================== */
+
+/* ---------------------------------------------------------------- state -- */
+const S = {
+  raw: null,          // {rows, fields, name} — the main table
+  attrRaw: null,      // {rows, fields, name} — optional node-attribute table
+  map: null,          // column mapping chosen by the user
+  G: null,            // {nodes, links, byId, adj}
+  view: {
+    layout: "force",
+    threshold: 0,       // minimum edge weight to draw
+    colorBy: "__none__",
+    sizeBy: "degree",
+    sizeScale: 1,
+    labelMode: "top",   // all | top | none
+    labelTop: 25,
+    labelSize: 11,
+    edgeOpacity: .35,
+    edgeWidth: 1,
+    curved: false,
+    dark: false,
+    hidden: new Set()   // hidden category values (legend toggles)
+  },
+  tf: d3.zoomIdentity,
+  sim: null,
+  hover: null,
+  hoverLink: null,
+  selected: null,       // node with ego highlight
+  picked: new Set(),    // ids marked for export as a group
+  selectMode: false,    // drag draws a selection box instead of panning
+  box: null,            // the box being dragged, in screen coordinates
+  palette: {},          // category value -> colour
+  metricsDone: new Set(),
+  stats: null
+};
+
+const CANVAS = document.getElementById("cv");
+const CTX = CANVAS.getContext("2d");
+const STAGE = document.getElementById("stage");
+const TIP = document.getElementById("tip");
+
+/* ---------------------------------------------------------------- utils -- */
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmt = (v, d = 3) => {
+  if (v == null || Number.isNaN(v)) return "—";
+  if (Number.isInteger(v)) return v.toLocaleString();
+  if (Math.abs(v) >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 1 });
+  if (Math.abs(v) < 0.001 && v !== 0) return v.toExponential(2);
+  return (+v).toFixed(d).replace(/\.?0+$/, "");
+};
+const busy = (on, msg = "Working…") => {
+  const b = document.getElementById("busy");
+  b.textContent = msg; b.style.display = on ? "flex" : "none";
+};
+const nextFrame = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+const PALETTE = ["#2f5fd0", "#e4572e", "#17a398", "#8f4bd8", "#e8a33d", "#2a9d3f", "#d1467f",
+  "#5b7fa6", "#a6761d", "#6a8f2f", "#c33c54", "#3d8bbf", "#8c6c9e", "#b07d4c",
+  "#4c9f8a", "#c9563c", "#7a7fbf", "#9d8b3f"];
+
+function download(filename, blobOrString, mime = "text/plain;charset=utf-8") {
+  const blob = blobOrString instanceof Blob ? blobOrString : new Blob(["﻿" + blobOrString], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+/* Math.max(...huge) overflows the stack — these stay safe on big graphs. */
+function maxOf(arr, get = v => v, seed = -Infinity) {
+  let m = seed;
+  for (const v of arr) { const x = get(v); if (x > m) m = x; }
+  return m;
+}
+function minOf(arr, get = v => v, seed = Infinity) {
+  let m = seed;
+  for (const v of arr) { const x = get(v); if (x < m) m = x; }
+  return m;
+}
+
+function toCSV(rows, cols) {
+  const q = v => {
+    const s = v == null ? "" : String(v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  return [cols.join(","), ...rows.map(r => cols.map(c => q(r[c])).join(","))].join("\n");
+}
+
+/* ------------------------------------------------------------------ tabs -- */
+$$("#tabs button").forEach(b => b.onclick = () => {
+  $$("#tabs button").forEach(x => x.classList.toggle("on", x === b));
+  $$(".panel").forEach(p => p.classList.toggle("on", p.dataset.panel === b.dataset.tab));
+});
+const showTab = name => $(`#tabs button[data-tab="${name}"]`).click();
+
+/* ----------------------------------------------------------------- modal -- */
+const MODAL = document.getElementById("modal");
+let modalOK = null;
+function openModal(title, html, onOK, okLabel = "Build network", note = "") {
+  $("#sheet-title").textContent = title;
+  $("#sheet-body").innerHTML = html;
+  $("#sheet-ok").textContent = okLabel;
+  $("#sheet-note").textContent = note;
+  $("#sheet-ok").style.display = onOK ? "" : "none";
+  modalOK = onOK;
+  MODAL.classList.add("on");
+}
+const closeModal = () => { MODAL.classList.remove("on"); modalOK = null; };
+$("#sheet-x").onclick = closeModal;
+$("#sheet-cancel").onclick = closeModal;
+$("#sheet-ok").onclick = () => { if (modalOK) modalOK(); };
+MODAL.addEventListener("click", e => { if (e.target === MODAL) closeModal(); });
+
+/* =========================================================== DATA PANEL === */
+function renderDataPanel() {
+  const p = $('[data-panel="data"]');
+  const loaded = !!S.G;
+  p.innerHTML = `
+  <div class="sect">
+    <h3>1 · Load a table</h3>
+    <div id="drop">
+      <strong>Drop a CSV here</strong>
+      <span>or click to choose a file · .csv, .tsv, .txt</span>
+    </div>
+    <input type="file" id="file" accept=".csv,.tsv,.txt,text/csv" hidden>
+    <div class="btnrow" style="margin-top:9px">
+      <button class="btn sm" id="demo">Load example dataset</button>
+      <button class="btn sm" id="loadsession">Open a saved session</button>
+      <input type="file" id="sessionfile" accept=".json" hidden>
+    </div>
+    <p class="hint">Nothing is uploaded. The file is read locally by your browser and stays on your machine.</p>
+  </div>
+
+  <div class="sect">
+    <h3>2 · Current network</h3>
+    ${loaded ? `
+      <div class="stat"><span>Source file</span><b>${esc(S.raw.name)}</b></div>
+      <div class="stat"><span>Nodes</span><b>${S.G.nodes.length.toLocaleString()}</b></div>
+      <div class="stat"><span>Edges</span><b>${S.G.links.length.toLocaleString()}</b></div>
+      <div class="stat"><span>Interpretation</span><b>${S.map.mode === "edges" ? "edge list" : "co-occurrence"}</b></div>
+      <div class="btnrow" style="margin-top:11px">
+        <button class="btn sm" id="remap">Change column mapping</button>
+        <button class="btn sm" id="clear">Clear</button>
+      </div>` :
+      `<p class="hint">No network yet. Load a CSV above, then map its columns.</p>`}
+  </div>
+
+  <div class="sect">
+    <h3>3 · Node attributes <span class="pill">optional</span></h3>
+    ${S.attrRaw ? `<div class="stat"><span>Attribute file</span><b>${esc(S.attrRaw.name)}</b></div>
+       <div class="stat"><span>Rows matched</span><b>${S.attrMatched || 0}</b></div>` : ""}
+    <button class="btn sm wide" id="attrbtn" ${loaded ? "" : "disabled"}>
+      ${S.attrRaw ? "Replace attribute table" : "Add a second CSV with node attributes"}
+    </button>
+    <input type="file" id="attrfile" accept=".csv,.tsv,.txt" hidden>
+    <p class="hint">A second table — one row per node — adds properties such as sect, gender, or dates that the
+      edge table does not carry. They become available for colouring, filtering and homophily.</p>
+  </div>
+
+  <div class="sect">
+    <h3>What kind of table works?</h3>
+    <div class="note">
+      <b>Edge list</b> — one row per relationship:<br>
+      <code style="font-size:11px">person_a, person_b, year</code><br><br>
+      <b>Co-occurrence list</b> — one row per membership; the tool links everyone who shares a group:<br>
+      <code style="font-size:11px">person, document, role</code>
+    </div>
+  </div>`;
+
+  // wiring
+  const drop = $("#drop"), file = $("#file");
+  drop.onclick = () => file.click();
+  drop.ondragover = e => { e.preventDefault(); drop.classList.add("hot"); };
+  drop.ondragleave = () => drop.classList.remove("hot");
+  drop.ondrop = e => {
+    e.preventDefault(); drop.classList.remove("hot");
+    if (e.dataTransfer.files[0]) readFile(e.dataTransfer.files[0], t => { S.raw = t; openMapper(); });
+  };
+  file.onchange = e => { if (e.target.files[0]) readFile(e.target.files[0], t => { S.raw = t; openMapper(); }); };
+
+  $("#demo").onclick = loadDemo;
+  $("#loadsession").onclick = () => $("#sessionfile").click();
+  $("#sessionfile").onchange = e => { if (e.target.files[0]) loadSession(e.target.files[0]); };
+
+  if (loaded) {
+    $("#remap").onclick = openMapper;
+    $("#clear").onclick = () => {
+      S.raw = S.attrRaw = S.map = S.G = S.stats = null;
+      S.metricsDone.clear(); S.selected = null;
+      if (S.sim) S.sim.stop();
+      $("#empty").style.display = "flex"; $("#legend").style.display = "none";
+      $("#statusbar").innerHTML = ""; draw(); renderAll();
+    };
+    const ab = $("#attrbtn");
+    ab.onclick = () => $("#attrfile").click();
+    $("#attrfile").onchange = e => {
+      if (e.target.files[0]) readFile(e.target.files[0], t => { S.attrRaw = t; openAttrMapper(); });
+    };
+  }
+}
+
+/* --------------------------------------------------------- file reading -- */
+function readFile(f, cb) {
+  busy(true, "Reading " + f.name + "…");
+  Papa.parse(f, {
+    header: true, skipEmptyLines: "greedy", dynamicTyping: false,
+    encoding: "UTF-8",           // handles the BOM that Excel writes
+    complete: res => {
+      busy(false);
+      const fields = (res.meta.fields || []).map(s => (s || "").replace(/^﻿/, "").trim()).filter(Boolean);
+      if (!fields.length) return alert("No columns found. Is this a CSV with a header row?");
+      // normalise keys (strip BOM/whitespace) so lookups are predictable
+      const rows = res.data.map(r => {
+        const o = {};
+        for (const k in r) o[(k || "").replace(/^﻿/, "").trim()] = r[k];
+        return o;
+      }).filter(r => fields.some(f2 => String(r[f2] ?? "").trim() !== ""));
+      cb({ rows, fields, name: f.name });
+    },
+    error: err => { busy(false); alert("Could not read the file: " + err.message); }
+  });
+}
+
+function parseCSVText(text, name) {
+  const res = Papa.parse(text.trim(), { header: true, skipEmptyLines: "greedy" });
+  const fields = (res.meta.fields || []).map(s => s.trim());
+  return { rows: res.data, fields, name };
+}
+
+function loadDemo() {
+  S.raw = parseCSVText($("#demo-appearances").textContent, "karaite_appearances.csv (example)");
+  S.attrRaw = parseCSVText($("#demo-persons").textContent, "karaite_persons.csv (example)");
+  S.map = {
+    mode: "co", a: "person", b: "shelfmark", weightCol: "__count__", agg: "sum", directed: false,
+    nodeInfo: ["role", "place", "doc_type"], edgeInfo: ["shelfmark", "year_est", "place"],
+    attrKey: "canonical_name", attrCols: ["sect", "gender", "num_docs", "year_min", "year_max", "origin_or_nisba_place"]
+  };
+  build();
+  S.view.colorBy = "sect";
+  S.view.labelTop = 25;
+  applyColours(); renderAll(); draw();
+  showTab("style");
+  toast("Example loaded: 350 people from Karaite Cairo Geniza legal documents, linked when they appear in the same document.");
+}
+
+let toastTimer = null;
+function toast(msg) {
+  let el = $("#toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "toast";
+    el.style.cssText = "position:absolute;bottom:44px;left:50%;transform:translateX(-50%);z-index:30;" +
+      "background:rgba(24,28,35,.94);color:#fff;padding:9px 14px;border-radius:9px;font-size:12.5px;" +
+      "max-width:520px;box-shadow:0 8px 28px rgba(0,0,0,.25);text-align:center";
+    STAGE.appendChild(el);
+  }
+  el.textContent = msg; el.style.display = "block";
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.style.display = "none"; }, 6000);
+}
+
+/* ======================================================= COLUMN MAPPING === */
+function guessCol(fields, patterns, fallbackIdx) {
+  for (const p of patterns) {
+    const hit = fields.find(f => new RegExp(p, "i").test(f));
+    if (hit) return hit;
+  }
+  return fields[fallbackIdx] ?? fields[0];
+}
+
+function openMapper() {
+  const F = S.raw.fields, prev = S.map || {};
+  const opts = (sel) => F.map(f => `<option value="${esc(f)}" ${f === sel ? "selected" : ""}>${esc(f)}</option>`).join("");
+  const numericish = F.filter(f => {
+    const vals = S.raw.rows.slice(0, 200).map(r => r[f]).filter(v => String(v ?? "").trim() !== "");
+    return vals.length && vals.every(v => !Number.isNaN(parseFloat(v)));
+  });
+
+  const mode = prev.mode || "co";
+  const a = prev.a || guessCol(F, ["^source$", "^from$", "person", "name", "actor", "node", "id$"], 0);
+  const b = prev.b || guessCol(F, ["^target$", "^to$", "document", "shelfmark", "event", "group", "title"], 1);
+
+  const previewCols = F.slice(0, 8);
+  const preview = `
+    <div class="tblwrap" style="max-height:150px;margin-bottom:16px">
+      <table><thead><tr>${previewCols.map(c => `<th>${esc(c)}</th>`).join("")}${F.length > 8 ? "<th>…</th>" : ""}</tr></thead>
+      <tbody>${S.raw.rows.slice(0, 4).map(r => `<tr>${previewCols.map(c =>
+    `<td>${esc(String(r[c] ?? "").slice(0, 40))}</td>`).join("")}${F.length > 8 ? "<td>…</td>" : ""}</tr>`).join("")}</tbody></table>
+    </div>`;
+
+  openModal("Map your columns", `
+    ${preview}
+    <p class="hint" style="margin:-10px 0 14px">${S.raw.rows.length.toLocaleString()} rows · ${F.length} columns · showing the first 4 rows</p>
+
+    <div class="sect">
+      <h3>How should each row be read?</h3>
+      <div class="grid2">
+        <div class="modecard ${mode === "co" ? "on" : ""}" data-mode="co">
+          <b>Co-occurrence (two-mode)</b>
+          <span>Each row says “this person took part in this document / event / group”. Everyone sharing a group
+          gets connected, and the edge weight is how many groups they share.</span>
+        </div>
+        <div class="modecard ${mode === "edges" ? "on" : ""}" data-mode="edges">
+          <b>Edge list (one-mode)</b>
+          <span>Each row already <i>is</i> a relationship between two nodes — A is linked to B.</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="sect">
+      <h3>Columns</h3>
+      <div class="grid2">
+        <div class="row">
+          <label id="lab-a">${mode === "co" ? "Node column (who / what becomes a node)" : "Source node column"}</label>
+          <select id="m-a">${opts(a)}</select>
+        </div>
+        <div class="row">
+          <label id="lab-b">${mode === "co" ? "Group column (what they share)" : "Target node column"}</label>
+          <select id="m-b">${opts(b)}</select>
+        </div>
+      </div>
+
+      <div class="grid2">
+        <div class="row">
+          <label>Edge weight</label>
+          <select id="m-w">
+            <option value="__count__">Count of shared rows (each row counts 1)</option>
+            ${numericish.map(f => `<option value="${esc(f)}" ${prev.weightCol === f ? "selected" : ""}>Sum values of “${esc(f)}”</option>`).join("")}
+          </select>
+          <p class="hint">How strongly two nodes are tied. The default counts how often they appear together.</p>
+        </div>
+        <div class="row">
+          <label>If the same pair repeats</label>
+          <select id="m-agg">
+            <option value="sum">Add the weights together</option>
+            <option value="max">Keep the largest</option>
+            <option value="mean">Average them</option>
+            <option value="first">Keep the first</option>
+          </select>
+          <p class="hint">Duplicate pairs are merged into one edge using this rule.</p>
+        </div>
+      </div>
+
+      <div class="row" id="dir-row" style="${mode === "co" ? "display:none" : ""}">
+        <label class="chk"><input type="checkbox" id="m-dir" ${prev.directed ? "checked" : ""}>
+          <span>Directed — A → B means something different from B → A (arrows are drawn, and metrics respect direction)</span></label>
+      </div>
+    </div>
+
+    <div class="sect">
+      <h3>What to show on hover</h3>
+      <div class="grid2">
+        <div class="row">
+          <label>Node details</label>
+          <div class="scrollbox" id="m-nodeinfo">
+            ${F.map(f => `<label class="chk"><input type="checkbox" value="${esc(f)}"
+              ${(prev.nodeInfo || []).includes(f) ? "checked" : ""}><span>${esc(f)}</span></label>`).join("")}
+          </div>
+          <p class="hint">Shown when the cursor is over a node. For repeated values the most frequent one is used.</p>
+        </div>
+        <div class="row">
+          <label>Edge details</label>
+          <div class="scrollbox" id="m-edgeinfo">
+            ${F.map(f => `<label class="chk"><input type="checkbox" value="${esc(f)}"
+              ${(prev.edgeInfo || []).includes(f) ? "checked" : ""}><span>${esc(f)}</span></label>`).join("")}
+          </div>
+          <p class="hint">Shown when the cursor is over a link. In co-occurrence mode this lists the shared groups.</p>
+        </div>
+      </div>
+    </div>`,
+    () => {
+      const m = {
+        mode: $(".modecard.on").dataset.mode,
+        a: $("#m-a").value, b: $("#m-b").value,
+        weightCol: $("#m-w").value, agg: $("#m-agg").value,
+        directed: $("#m-dir").checked,
+        nodeInfo: $$("#m-nodeinfo input:checked").map(i => i.value),
+        edgeInfo: $$("#m-edgeinfo input:checked").map(i => i.value),
+        attrKey: S.map?.attrKey, attrCols: S.map?.attrCols
+      };
+      if (m.a === m.b) return alert("The two columns must be different.");
+      S.map = m;
+      closeModal();
+      build();
+      applyColours(); renderAll(); draw();
+      showTab("style");
+    },
+    "Build network",
+    "Everything here can be changed later.");
+
+  if (prev.agg) $("#m-agg").value = prev.agg;
+
+  $$(".modecard").forEach(c => c.onclick = () => {
+    $$(".modecard").forEach(x => x.classList.toggle("on", x === c));
+    const co = c.dataset.mode === "co";
+    $("#lab-a").textContent = co ? "Node column (who / what becomes a node)" : "Source node column";
+    $("#lab-b").textContent = co ? "Group column (what they share)" : "Target node column";
+    $("#dir-row").style.display = co ? "none" : "";
+  });
+}
+
+function openAttrMapper() {
+  const F = S.attrRaw.fields;
+  const guessKey = guessCol(F, ["name", "^id$", "person", "label", "node"], 0);
+  openModal("Node attributes", `
+    <p class="hint" style="margin-bottom:14px">${S.attrRaw.rows.length.toLocaleString()} rows · ${F.length} columns.
+      Rows are matched to nodes by name.</p>
+    <div class="row">
+      <label>Which column holds the node name?</label>
+      <select id="a-key">${F.map(f => `<option ${f === guessKey ? "selected" : ""}>${esc(f)}</option>`).join("")}</select>
+      <p class="hint">Values must match the node names in your main table (matching ignores case and spacing).</p>
+    </div>
+    <div class="row">
+      <label>Attributes to attach</label>
+      <div class="scrollbox" style="max-height:230px" id="a-cols">
+        ${F.map(f => `<label class="chk"><input type="checkbox" value="${esc(f)}" ${f === guessKey ? "" : "checked"}>
+          <span>${esc(f)}</span></label>`).join("")}
+      </div>
+    </div>`,
+    () => {
+      S.map.attrKey = $("#a-key").value;
+      S.map.attrCols = $$("#a-cols input:checked").map(i => i.value).filter(c => c !== S.map.attrKey);
+      closeModal();
+      attachAttributes();
+      applyColours(); renderAll(); draw();
+      toast(`Attributes attached to ${S.attrMatched} of ${S.G.nodes.length} nodes.`);
+    }, "Attach attributes");
+}
+
+/* ========================================================= GRAPH BUILD === */
+const normKey = s => String(s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+
+function build() {
+  busy(true, "Building the network…");
+  const m = S.map, rows = S.raw.rows;
+  const nodes = new Map();   // key -> node
+  const linkMap = new Map(); // "a b" -> link
+
+  const getNode = (name) => {
+    const k = normKey(name);
+    if (!nodes.has(k)) nodes.set(k, {
+      id: k, label: String(name).trim(), attrs: {}, _info: {}, m: {},
+      x: 0, y: 0, fx: null, fy: null, groups: new Set()
+    });
+    return nodes.get(k);
+  };
+  const noteInfo = (node, row) => {
+    for (const c of m.nodeInfo) {
+      const v = String(row[c] ?? "").trim();
+      if (!v) continue;
+      (node._info[c] ||= new Map()).set(v, (node._info[c]?.get(v) || 0) + 1);
+    }
+  };
+  const wOf = row => m.weightCol === "__count__" ? 1 : (parseFloat(row[m.weightCol]) || 0);
+
+  const addLink = (na, nb, w, row, group) => {
+    let s = na.id, t = nb.id;
+    if (!(m.mode === "edges" && m.directed) && s > t) { const x = s; s = t; t = x; }
+    const key = s + " " + t;
+    let L = linkMap.get(key);
+    if (!L) {
+      L = { s, t, w: 0, n: 0, _w: [], info: {}, groups: [] };
+      linkMap.set(key, L);
+    }
+    L.n++; L._w.push(w);
+    if (group != null) L.groups.push(group);
+    if (row) for (const c of m.edgeInfo) {
+      const v = String(row[c] ?? "").trim();
+      if (v && (L.info[c] ||= []).length < 40 && !L.info[c].includes(v)) L.info[c].push(v);
+    }
+    return L;
+  };
+
+  if (m.mode === "edges") {
+    for (const r of rows) {
+      const av = String(r[m.a] ?? "").trim(), bv = String(r[m.b] ?? "").trim();
+      if (!av || !bv || normKey(av) === normKey(bv)) continue;   // skip blanks and self-loops
+      const na = getNode(av), nb = getNode(bv);
+      noteInfo(na, r); noteInfo(nb, r);
+      addLink(na, nb, wOf(r), r, null);
+    }
+  } else {
+    // two-mode: bucket rows by group, then connect every pair inside a bucket
+    const groups = new Map();
+    for (const r of rows) {
+      const av = String(r[m.a] ?? "").trim(), gv = String(r[m.b] ?? "").trim();
+      if (!av || !gv) continue;
+      const na = getNode(av);
+      noteInfo(na, r);
+      na.groups.add(gv);
+      (groups.get(gv) || groups.set(gv, []).get(gv)).push({ node: na, row: r });
+    }
+    let pairCount = 0;
+    for (const [gv, members] of groups) {
+      // de-duplicate a person appearing twice in the same group
+      const seen = new Map();
+      for (const mem of members) if (!seen.has(mem.node.id)) seen.set(mem.node.id, mem);
+      const list = [...seen.values()];
+      pairCount += list.length * (list.length - 1) / 2;
+      if (list.length > 400) continue;      // a single group that huge would blow up the graph
+      for (let i = 0; i < list.length; i++)
+        for (let j = i + 1; j < list.length; j++) {
+          const w = m.weightCol === "__count__" ? 1 : Math.min(wOf(list[i].row), wOf(list[j].row));
+          const L = addLink(list[i].node, list[j].node, w, list[i].row, gv);
+          for (const c of m.edgeInfo) {
+            const v = String(list[j].row[c] ?? "").trim();
+            if (v && (L.info[c] ||= []).length < 40 && !L.info[c].includes(v)) L.info[c].push(v);
+          }
+        }
+    }
+    S.pairCount = pairCount;
+  }
+
+  // finalise weights
+  for (const L of linkMap.values()) {
+    const a = L._w;
+    L.w = m.agg === "sum" ? a.reduce((x, y) => x + y, 0)
+      : m.agg === "max" ? maxOf(a)
+        : m.agg === "mean" ? a.reduce((x, y) => x + y, 0) / a.length
+          : a[0];
+    delete L._w;
+  }
+
+  // condense the most-frequent hover value per node
+  for (const n of nodes.values()) {
+    for (const c in n._info) {
+      const sorted = [...n._info[c].entries()].sort((x, y) => y[1] - x[1]);
+      n.attrs[c] = sorted[0][0] + (sorted.length > 1 ? ` (+${sorted.length - 1} more)` : "");
+    }
+    delete n._info;
+    if (n.groups.size) { n.attrs["# groups"] = n.groups.size; }
+    n.groups = [...n.groups];
+  }
+
+  const nodeList = [...nodes.values()];
+  const byId = new Map(nodeList.map(n => [n.id, n]));
+  const links = [...linkMap.values()].map(L => ({ ...L, source: byId.get(L.s), target: byId.get(L.t) }));
+
+  S.G = { nodes: nodeList, links, byId };
+  indexGraph();
+  seedLayout();
+  if (S.attrRaw && S.map.attrKey) attachAttributes();
+
+  S.metricsDone.clear(); S.stats = null; S.selected = null;
+  S.picked.clear(); S.view.onlyPicked = false;
+  S.view.threshold = 0;
+  S.view.hidden.clear();
+  computeBasics();
+  $("#empty").style.display = nodeList.length ? "none" : "flex";
+  busy(false);
+  if (S.pairCount > 250000) toast("This is a dense co-occurrence network — use the weight threshold in Style to thin it out.");
+}
+
+function indexGraph() {
+  const { nodes, links } = S.G;
+  const adj = new Map(nodes.map(n => [n.id, []]));
+  for (const L of links) {
+    adj.get(L.s).push({ o: L.t, w: L.w, L, out: true });
+    adj.get(L.t).push({ o: L.s, w: L.w, L, out: false });
+  }
+  S.G.adj = adj;
+  for (const n of nodes) {
+    const nb = adj.get(n.id);
+    n.deg = nb.length;
+    n.str = nb.reduce((a, e) => a + e.w, 0);
+  }
+  // connected components — the layout needs them so that small fragments and
+  // isolated nodes stay near the picture instead of being flung to the rim
+  const seen = new Set();
+  let cid = 0;
+  for (const start of nodes) {
+    if (seen.has(start.id)) continue;
+    const stack = [start.id], members = [];
+    seen.add(start.id);
+    while (stack.length) {
+      const id = stack.pop();
+      members.push(id);
+      for (const e of adj.get(id)) if (!seen.has(e.o)) { seen.add(e.o); stack.push(e.o); }
+    }
+    for (const id of members) {
+      const nd = S.G.byId.get(id);
+      nd.comp = cid; nd.compSize = members.length;
+    }
+    cid++;
+  }
+  S.G.componentCount = cid;
+}
+
+function attachAttributes() {
+  if (!S.attrRaw || !S.map.attrKey) return;
+  const idx = new Map();
+  for (const r of S.attrRaw.rows) {
+    const k = normKey(r[S.map.attrKey]);
+    if (k && !idx.has(k)) idx.set(k, r);
+  }
+  let hit = 0;
+  for (const n of S.G.nodes) {
+    const r = idx.get(n.id);
+    if (!r) continue;
+    hit++;
+    for (const c of (S.map.attrCols || [])) {
+      const v = String(r[c] ?? "").trim();
+      if (v) n.attrs[c] = v;
+    }
+  }
+  S.attrMatched = hit;
+}
+
+function computeBasics() {
+  for (const n of S.G.nodes) { n.m.degree = n.deg; n.m.strength = n.str; }
+  S.metricsDone.add("degree"); S.metricsDone.add("strength");
+}
+
+/* --------------------------------------------------------- attribute list -- */
+function attributeKeys() {
+  const keys = new Set();
+  for (const n of S.G?.nodes || []) for (const k in n.attrs) keys.add(k);
+  return [...keys];
+}
+function categoricalKeys() {
+  // attributes with a manageable number of distinct values
+  return attributeKeys().filter(k => {
+    const vals = new Set(S.G.nodes.map(n => n.attrs[k]).filter(v => v != null && v !== ""));
+    return vals.size > 1 && vals.size <= 40;
+  });
+}
+function valuesOf(key) {
+  const c = new Map();
+  for (const n of S.G.nodes) {
+    const v = n.attrs[key];
+    if (v == null || v === "") continue;
+    c.set(v, (c.get(v) || 0) + 1);
+  }
+  return [...c.entries()].sort((a, b) => b[1] - a[1]);
+}
+function applyColours() {
+  S.palette = {};
+  const key = S.view.colorBy;
+  if (key === "__none__" || key === "__community__") return;
+  valuesOf(key).forEach(([v], i) => S.palette[v] = PALETTE[i % PALETTE.length]);
+}
+/* ========================================================== LAYOUT ======= */
+function seedLayout() {
+  const n = S.G.nodes.length, R = 40 + Math.sqrt(n) * 26;
+  S.G.nodes.forEach((d, i) => {
+    const a = i * 2.399963229728653;            // golden-angle spread
+    d.x = Math.cos(a) * R * Math.sqrt(i / n + .02);
+    d.y = Math.sin(a) * R * Math.sqrt(i / n + .02);
+    d.vx = d.vy = 0;
+  });
+}
+
+function runLayout(kind = S.view.layout) {
+  if (!S.G) return;
+  S.view.layout = kind;
+  if (S.sim) { S.sim.stop(); S.sim = null; }
+  const { nodes } = S.G;
+  const links = visibleLinks();
+  const n = nodes.length;
+
+  if (kind === "circle") {
+    const order = [...nodes].sort((a, b) =>
+      (b.m[S.view.sizeBy] ?? b.deg) - (a.m[S.view.sizeBy] ?? a.deg));
+    const R = 60 + n * 3.2;
+    order.forEach((d, i) => {
+      const a = (i / n) * Math.PI * 2 - Math.PI / 2;
+      d.x = Math.cos(a) * R; d.y = Math.sin(a) * R; d.fx = d.fy = null;
+    });
+    fit(); draw(); return;
+  }
+
+  if (kind === "grid") {
+    const key = S.view.colorBy === "__none__" ? "__community__" : S.view.colorBy;
+    const groups = new Map();
+    for (const d of nodes) {
+      const g = key === "__community__" ? (d.m.community ?? 0) : (d.attrs[key] ?? "—");
+      (groups.get(g) || groups.set(g, []).get(g)).push(d);
+    }
+    const gs = [...groups.entries()].sort((a, b) => b[1].length - a[1].length);
+    const cols = Math.ceil(Math.sqrt(gs.length));
+    const cell = 130 + Math.sqrt(n) * 22;
+    gs.forEach(([, members], gi) => {
+      const cx = (gi % cols) * cell - (cols - 1) * cell / 2;
+      const cy = Math.floor(gi / cols) * cell - (Math.ceil(gs.length / cols) - 1) * cell / 2;
+      const r = 8 + Math.sqrt(members.length) * 9;
+      members.forEach((d, i) => {
+        const a = (i / members.length) * Math.PI * 2;
+        const rr = r * (0.35 + 0.65 * Math.sqrt((i + 1) / members.length));
+        d.x = cx + Math.cos(a) * rr; d.y = cy + Math.sin(a) * rr; d.fx = d.fy = null;
+      });
+    });
+    fit(); draw(); return;
+  }
+
+  // force-directed.
+  // Two things keep a dense co-occurrence graph from collapsing into a blob:
+  //  · link strength is divided by the smaller endpoint degree (d3's own rule),
+  //    so a hub with 60 links is not dragged inward 60 times as hard;
+  //  · repulsion scales with the drawn radius, so big nodes claim more room.
+  // A weak pull toward the origin — stronger for small fragments — keeps
+  // isolates and two-node components orbiting close instead of defining the
+  // extent of the whole picture.
+  const maxW = Math.max(1, maxOf(links, l => l.w));
+  const home = componentHomes(nodes);
+  S.sim = d3.forceSimulation(nodes)
+    .force("link", d3.forceLink(links).id(d => d.id)
+      .distance(l => 34 + 26 * (1 - l.w / maxW))
+      .strength(l => (0.25 + 0.5 * (l.w / maxW)) /
+        Math.max(1, Math.min(l.source.deg || 1, l.target.deg || 1))))
+    .force("charge", d3.forceManyBody()
+      .strength(d => -(38 + 11 * radiusOf(d)) * (1 + 40 / Math.sqrt(Math.max(n, 4))))
+      .distanceMax(900).theta(0.9))
+    .force("x", d3.forceX(d => home.get(d.comp ?? 0)[0]).strength(d => home.get(d.comp ?? 0)[2]))
+    .force("y", d3.forceY(d => home.get(d.comp ?? 0)[1]).strength(d => home.get(d.comp ?? 0)[2]))
+    .force("collide", d3.forceCollide(d => radiusOf(d) + 3).iterations(2))
+    .alpha(1).alphaDecay(0.018)
+    .on("tick", draw)
+    .on("end", () => { draw(); });
+
+  if (S.view.layout === "communities" && S.metricsDone.has("community")) {
+    const cs = new Map();
+    for (const d of nodes) {
+      const c = d.m.community ?? 0;
+      if (!cs.has(c)) cs.set(c, cs.size);
+    }
+    const N = cs.size, R = 90 + n * 1.6;
+    const cxy = new Map([...cs].map(([c, i]) => [c,
+      [Math.cos(i / N * 2 * Math.PI) * R, Math.sin(i / N * 2 * Math.PI) * R]]));
+    S.sim.force("cx", d3.forceX(d => cxy.get(d.m.community ?? 0)[0]).strength(.16))
+      .force("cy", d3.forceY(d => cxy.get(d.m.community ?? 0)[1]).strength(.16));
+  }
+  setTimeout(fit, 700);
+}
+
+/** Where each connected component should sit: the largest in the middle, the
+    rest ringed around it, so a handful of stray pairs cannot hijack the frame. */
+function componentHomes(nodes) {
+  const sizes = new Map();
+  for (const d of nodes) sizes.set(d.comp ?? 0, (sizes.get(d.comp ?? 0) || 0) + 1);
+  const order = [...sizes.entries()].sort((a, b) => b[1] - a[1]);
+  const home = new Map();
+  if (!order.length) return home;
+  const [mainId, mainSize] = order[0];
+  home.set(mainId, [0, 0, 0.012]);
+  const R = 46 * Math.sqrt(mainSize) + 90;
+  const rest = order.slice(1);
+  // walk outward in rings, each component parked on its own slot
+  let ring = 0, slot = 0, perRing = Math.max(6, Math.round(2 * Math.PI * R / 120));
+  for (const [cid, size] of rest) {
+    const rr = R + ring * 130;
+    const a = (slot / perRing) * Math.PI * 2 + ring * 0.5;
+    home.set(cid, [Math.cos(a) * rr, Math.sin(a) * rr, 0.14 + 0.5 / Math.sqrt(size + 1)]);
+    if (++slot >= perRing) { slot = 0; ring++; perRing = Math.max(6, Math.round(2 * Math.PI * (R + ring * 130) / 120)); }
+  }
+  return home;
+}
+
+function visibleLinks() {
+  const th = S.view.threshold;
+  const only = S.view.onlyPicked && S.picked.size;
+  return S.G.links.filter(l => l.w >= th && !isHidden(l.source) && !isHidden(l.target) &&
+    (!only || (S.picked.has(l.s) && S.picked.has(l.t))));
+}
+function visibleNodes() {
+  let ns = S.G.nodes.filter(n => !isHidden(n));
+  if (S.view.onlyPicked && S.picked.size) ns = ns.filter(n => S.picked.has(n.id));
+  if (S.view.hideIsolates) {
+    const live = new Set();
+    for (const L of visibleLinks()) { live.add(L.s); live.add(L.t); }
+    ns = ns.filter(n => live.has(n.id));
+  }
+  return ns;
+}
+function isHidden(n) {
+  const key = S.view.colorBy;
+  if (key === "__none__" || !S.view.hidden.size) return false;
+  const v = key === "__community__" ? "C" + (n.m.community ?? 0) : (n.attrs[key] ?? "—");
+  return S.view.hidden.has(String(v));
+}
+
+/* ========================================================== RENDERING ==== */
+let DPR = Math.min(window.devicePixelRatio || 1, 2);
+function sizeCanvas() {
+  const r = STAGE.getBoundingClientRect();
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  CANVAS.width = Math.round(r.width * DPR);
+  CANVAS.height = Math.round(r.height * DPR);
+  CANVAS.style.width = r.width + "px";
+  CANVAS.style.height = r.height + "px";
+  draw();
+}
+window.addEventListener("resize", sizeCanvas);
+
+function radiusOf(d) {
+  const key = S.view.sizeBy;
+  if (key === "__uniform__") return 5 * S.view.sizeScale;
+  const v = d.m[key];
+  if (v == null) return 5 * S.view.sizeScale;
+  const ext = S.sizeExtent?.[key];
+  if (!ext) return 5 * S.view.sizeScale;
+  const t = ext[1] > ext[0] ? (v - ext[0]) / (ext[1] - ext[0]) : 0;
+  return (3.2 + 13 * Math.sqrt(t)) * S.view.sizeScale;
+}
+function refreshSizeExtent() {
+  S.sizeExtent = {};
+  if (!S.G) return;
+  const keys = new Set(["degree", "strength"]);
+  for (const n of S.G.nodes) for (const k in n.m) keys.add(k);
+  for (const k of keys) {
+    let lo = Infinity, hi = -Infinity;
+    for (const n of S.G.nodes) {
+      const v = n.m[k];
+      if (typeof v === "number" && Number.isFinite(v)) { if (v < lo) lo = v; if (v > hi) hi = v; }
+    }
+    if (lo <= hi) S.sizeExtent[k] = [lo, hi];
+  }
+}
+
+function colourOf(d) {
+  const key = S.view.colorBy;
+  if (key === "__none__") return "#5b7fa6";
+  if (key === "__community__") {
+    const c = d.m.community;
+    return c == null ? "#b8c0cc" : PALETTE[c % PALETTE.length];
+  }
+  const v = d.attrs[key];
+  return (v == null || v === "") ? "#c3cad4" : (S.palette[v] || "#c3cad4");
+}
+
+function draw() {
+  const w = CANVAS.width, h = CANVAS.height;
+  CTX.save();
+  CTX.setTransform(1, 0, 0, 1, 0, 0);
+  CTX.fillStyle = S.view.dark ? "#12161c" : "#ffffff";
+  CTX.fillRect(0, 0, w, h);
+  if (!S.G) { CTX.restore(); return; }
+  CTX.scale(DPR, DPR);
+  CTX.translate(S.tf.x, S.tf.y);
+  CTX.scale(S.tf.k, S.tf.k);
+  paint(CTX, S.tf.k);
+  CTX.restore();
+
+  if (S.box) {                                 // the marquee, drawn in screen space
+    const [x0, y0, x1, y1] = S.box;
+    CTX.save();
+    CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+    CTX.fillStyle = "rgba(47,95,208,.10)";
+    CTX.strokeStyle = "#2f5fd0";
+    CTX.lineWidth = 1;
+    CTX.setLineDash([4, 3]);
+    CTX.fillRect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+    CTX.strokeRect(Math.min(x0, x1) + .5, Math.min(y0, y1) + .5, Math.abs(x1 - x0), Math.abs(y1 - y0));
+    CTX.restore();
+  }
+}
+
+/* the single painting routine, shared by the screen and by PNG export */
+function paint(ctx, k) {
+  const V = S.view;
+  const links = visibleLinks();
+  const nodes = visibleNodes();
+  const ego = S.selected ? new Set([S.selected.id, ...S.G.adj.get(S.selected.id).map(e => e.o)]) : null;
+  const maxW = Math.max(1, maxOf(links, l => l.w));
+
+  // ---- edges
+  ctx.lineCap = "round";
+  for (const L of links) {
+    const dim = ego && !(ego.has(L.s) && ego.has(L.t));
+    const hot = S.hoverLink === L;
+    ctx.globalAlpha = hot ? .95 : dim ? V.edgeOpacity * .12 : V.edgeOpacity;
+    ctx.strokeStyle = hot ? "#e4572e" : (V.dark ? "#8fa3bd" : "#6f7d90");
+    ctx.lineWidth = ((0.35 + 2.4 * Math.sqrt(L.w / maxW)) * V.edgeWidth) / Math.max(k, .35);
+    ctx.beginPath();
+    ctx.moveTo(L.source.x, L.source.y);
+    if (V.curved) {
+      const mx = (L.source.x + L.target.x) / 2, my = (L.source.y + L.target.y) / 2;
+      const dx = L.target.x - L.source.x, dy = L.target.y - L.source.y;
+      ctx.quadraticCurveTo(mx - dy * .12, my + dx * .12, L.target.x, L.target.y);
+    } else ctx.lineTo(L.target.x, L.target.y);
+    ctx.stroke();
+    if (S.map?.directed && k > .55) drawArrow(ctx, L, k);
+  }
+
+  // ---- nodes
+  ctx.globalAlpha = 1;
+  for (const d of nodes) {
+    const dim = ego && !ego.has(d.id);
+    const r = radiusOf(d);
+    ctx.globalAlpha = dim ? .18 : 1;
+    ctx.beginPath();
+    ctx.arc(d.x, d.y, r, 0, 6.2832);
+    ctx.fillStyle = colourOf(d);
+    ctx.fill();
+    ctx.lineWidth = (d === S.hover || d === S.selected ? 2.4 : .9) / Math.max(k, .4);
+    ctx.strokeStyle = d === S.hover || d === S.selected ? "#111826"
+      : (V.dark ? "rgba(255,255,255,.35)" : "rgba(255,255,255,.9)");
+    ctx.stroke();
+    if (S.picked.has(d.id)) {                 // marked for export
+      ctx.beginPath(); ctx.arc(d.x, d.y, r + 4.5 / Math.max(k, .4), 0, 6.2832);
+      ctx.strokeStyle = "#e4572e";
+      ctx.lineWidth = 2.2 / Math.max(k, .4);
+      ctx.stroke();
+    }
+    if (d.fx != null) {                       // pinned marker
+      ctx.beginPath(); ctx.arc(d.x, d.y, r + 3 / Math.max(k, .4), 0, 6.2832);
+      ctx.strokeStyle = "#e4572e"; ctx.lineWidth = 1.2 / Math.max(k, .4);
+      ctx.setLineDash([2 / k, 2 / k]); ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+
+  // ---- labels
+  ctx.globalAlpha = 1;
+  const placed = placeLabels(nodes, k);
+  if (placed.length) {
+    const fs = V.labelSize / Math.max(k, .28);
+    ctx.font = `${fs}px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif`;
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    ctx.lineJoin = "round";
+    for (const { node: d, y } of placed) {
+      const dim = ego && !ego.has(d.id);
+      ctx.globalAlpha = dim ? .16 : 1;
+      ctx.lineWidth = 3.4 / Math.max(k, .4);
+      ctx.strokeStyle = V.dark ? "rgba(18,22,28,.92)" : "rgba(255,255,255,.92)";
+      ctx.strokeText(d.label, d.x, y);
+      ctx.fillStyle = V.dark ? "#e8edf4" : "#1b1f26";
+      ctx.fillText(d.label, d.x, y);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+/** Decide which labels actually get drawn: most important first, and a label
+    is dropped when it would land on top of one already placed. */
+function placeLabels(nodes, k) {
+  const V = S.view;
+  const wanted = labelSet(nodes);
+  if (!wanted.size) return [];
+  const fs = V.labelSize / Math.max(k, .28);
+  CTX.save();
+  CTX.font = `${fs}px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif`;
+  const rankKey = S.sizeExtent?.[V.sizeBy] ? V.sizeBy : "degree";
+  const list = nodes.filter(d => wanted.has(d.id))
+    .sort((a, b) => (b.m[rankKey] ?? 0) - (a.m[rankKey] ?? 0));
+  const boxes = [], out = [];
+  const pad = 1.5 / Math.max(k, .4);
+  for (const d of list) {
+    const w = CTX.measureText(d.label).width;
+    const y = d.y + radiusOf(d) + 2 / Math.max(k, .4);
+    const box = [d.x - w / 2 - pad, y - pad, d.x + w / 2 + pad, y + fs + pad];
+    const always = d === S.hover || d === S.selected;
+    if (!always && boxes.some(b => box[0] < b[2] && box[2] > b[0] && box[1] < b[3] && box[3] > b[1])) continue;
+    boxes.push(box);
+    out.push({ node: d, y, w, fs });
+  }
+  CTX.restore();
+  return out;
+}
+
+function drawArrow(ctx, L, k) {
+  const r = radiusOf(L.target);
+  const dx = L.target.x - L.source.x, dy = L.target.y - L.source.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const ux = dx / len, uy = dy / len;
+  const tipX = L.target.x - ux * (r + 1), tipY = L.target.y - uy * (r + 1);
+  const a = 6 / Math.max(k, .5);
+  ctx.beginPath();
+  ctx.moveTo(tipX, tipY);
+  ctx.lineTo(tipX - ux * a - uy * a * .45, tipY - uy * a + ux * a * .45);
+  ctx.lineTo(tipX - ux * a + uy * a * .45, tipY - uy * a - ux * a * .45);
+  ctx.closePath();
+  ctx.fillStyle = ctx.strokeStyle;
+  ctx.fill();
+}
+
+function labelSet(nodes) {
+  const V = S.view;
+  if (V.labelMode === "none") return new Set();
+  if (V.labelMode === "all") return new Set(nodes.map(n => n.id));
+  const key = S.sizeExtent?.[V.sizeBy] ? V.sizeBy : "degree";
+  const top = [...nodes].sort((a, b) => (b.m[key] ?? 0) - (a.m[key] ?? 0)).slice(0, V.labelTop);
+  const s = new Set(top.map(n => n.id));
+  if (S.selected) { s.add(S.selected.id); for (const e of S.G.adj.get(S.selected.id)) s.add(e.o); }
+  if (S.hover) s.add(S.hover.id);
+  return s;
+}
+
+/* ========================================================= INTERACTION == */
+const zoom = d3.zoom().scaleExtent([0.02, 14])
+  // the wheel always zooms; a drag pans unless we are marquee-selecting
+  .filter(ev => ev.type === "wheel" ? true : !(ev.button || S.selectMode || ev.shiftKey))
+  .on("zoom", ev => { S.tf = ev.transform; draw(); });
+d3.select(CANVAS).call(zoom).on("dblclick.zoom", null);
+
+function fit(pad = 60) {
+  if (!S.G || !S.G.nodes.length) return;
+  const ns = visibleNodes().length ? visibleNodes() : S.G.nodes;
+  const x0 = minOf(ns, d => d.x), x1 = maxOf(ns, d => d.x);
+  const y0 = minOf(ns, d => d.y), y1 = maxOf(ns, d => d.y);
+  const r = STAGE.getBoundingClientRect();
+  const k = Math.min(8, 0.95 * Math.min((r.width - pad * 2) / Math.max(x1 - x0, 1),
+    (r.height - pad * 2) / Math.max(y1 - y0, 1)));
+  const t = d3.zoomIdentity
+    .translate(r.width / 2 - k * (x0 + x1) / 2, r.height / 2 - k * (y0 + y1) / 2)
+    .scale(k);
+  d3.select(CANVAS).transition().duration(400).call(zoom.transform, t);
+}
+$("#zin").onclick = () => d3.select(CANVAS).transition().duration(220).call(zoom.scaleBy, 1.5);
+$("#zout").onclick = () => d3.select(CANVAS).transition().duration(220).call(zoom.scaleBy, 1 / 1.5);
+$("#zfit").onclick = () => fit();
+
+function atPoint(mx, my) {
+  if (!S.G) return { node: null, link: null };
+  const p = S.tf.invert([mx, my]);
+  let best = null, bestD = Infinity;
+  for (const d of visibleNodes()) {
+    const r = radiusOf(d) + 4 / S.tf.k;
+    const dd = (d.x - p[0]) ** 2 + (d.y - p[1]) ** 2;
+    if (dd < r * r && dd < bestD) { best = d; bestD = dd; }
+  }
+  if (best) return { node: best, link: null };
+  // nearest edge within a few pixels
+  const tol = 5 / S.tf.k;
+  let bl = null, blD = tol;
+  for (const L of visibleLinks()) {
+    const d = distToSeg(p[0], p[1], L.source.x, L.source.y, L.target.x, L.target.y);
+    if (d < blD) { blD = d; bl = L; }
+  }
+  return { node: null, link: bl };
+}
+function distToSeg(px, py, x1, y1, x2, y2) {
+  const dx = x2 - x1, dy = y2 - y1, L2 = dx * dx + dy * dy;
+  let t = L2 ? ((px - x1) * dx + (py - y1) * dy) / L2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+
+let dragging = null, dragMoved = false, boxAdd = false;
+CANVAS.addEventListener("pointermove", e => {
+  const r = CANVAS.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  if (S.box) { S.box[2] = mx; S.box[3] = my; draw(); TIP.style.display = "none"; return; }
+  if (dragging) {
+    dragMoved = true;
+    const p = S.tf.invert([mx, my]);
+    dragging.fx = dragging.x = p[0];
+    dragging.fy = dragging.y = p[1];
+    if (S.sim) S.sim.alphaTarget(.22).restart(); else draw();
+    return;
+  }
+  const { node, link } = atPoint(mx, my);
+  if (node !== S.hover || link !== S.hoverLink) {
+    S.hover = node; S.hoverLink = link;
+    CANVAS.style.cursor = node ? "pointer" : link ? "crosshair" : "default";
+    draw();
+  }
+  if (node) showTip(nodeTip(node), e.clientX, e.clientY);
+  else if (link) showTip(linkTip(link), e.clientX, e.clientY);
+  else TIP.style.display = "none";
+});
+CANVAS.addEventListener("pointerleave", () => {
+  S.hover = S.hoverLink = null; TIP.style.display = "none"; draw();
+});
+CANVAS.addEventListener("pointerdown", e => {
+  const r = CANVAS.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  const { node } = atPoint(mx, my);
+  if (node && (e.shiftKey || e.metaKey || e.ctrlKey)) {   // add or remove from the marked group
+    S.picked.has(node.id) ? S.picked.delete(node.id) : S.picked.add(node.id);
+    renderSelectionBar(); renderExportPanel(); draw();
+    e.stopPropagation();
+    return;
+  }
+  if (node) {
+    dragging = node; dragMoved = false;
+    CANVAS.setPointerCapture(e.pointerId);
+    e.stopPropagation();
+    return;
+  }
+  if (S.selectMode || e.shiftKey) {                       // start a marquee
+    boxAdd = e.shiftKey || e.metaKey || e.ctrlKey;
+    S.box = [mx, my, mx, my];
+    CANVAS.setPointerCapture(e.pointerId);
+    e.stopPropagation();
+  }
+});
+CANVAS.addEventListener("pointerup", e => {
+  if (S.box) {
+    const [x0, y0, x1, y1] = S.box;
+    S.box = null;
+    if (Math.abs(x1 - x0) > 3 && Math.abs(y1 - y0) > 3) {
+      const a = S.tf.invert([Math.min(x0, x1), Math.min(y0, y1)]);
+      const b = S.tf.invert([Math.max(x0, x1), Math.max(y0, y1)]);
+      if (!boxAdd) S.picked.clear();
+      for (const d of visibleNodes())
+        if (d.x >= a[0] && d.x <= b[0] && d.y >= a[1] && d.y <= b[1]) S.picked.add(d.id);
+      renderSelectionBar(); renderExportPanel();
+    }
+    draw();
+    return;
+  }
+  if (dragging) {
+    if (S.sim) S.sim.alphaTarget(0);
+    if (!dragMoved) {                       // a click, not a drag → toggle ego view
+      S.selected = S.selected === dragging ? null : dragging;
+      dragging.fx = dragging.fy = null;
+      renderAnalysisSelection();
+    }
+    dragging = null; draw();
+  }
+});
+CANVAS.addEventListener("dblclick", e => {
+  const r = CANVAS.getBoundingClientRect();
+  const { node } = atPoint(e.clientX - r.left, e.clientY - r.top);
+  if (node) { node.fx = node.fy = null; if (S.sim) S.sim.alpha(.3).restart(); draw(); }
+});
+
+function showTip(html, cx, cy) {
+  TIP.innerHTML = html;
+  TIP.style.display = "block";
+  const r = STAGE.getBoundingClientRect(), tr = TIP.getBoundingClientRect();
+  let x = cx - r.left + 14, y = cy - r.top + 14;
+  if (x + tr.width > r.width - 8) x = cx - r.left - tr.width - 14;
+  if (y + tr.height > r.height - 8) y = cy - r.top - tr.height - 14;
+  TIP.style.left = Math.max(6, x) + "px";
+  TIP.style.top = Math.max(6, y) + "px";
+}
+const METRIC_LABEL = {
+  degree: "Degree", strength: "Weighted degree", betweenness: "Betweenness",
+  closeness: "Closeness", eigenvector: "Eigenvector", pagerank: "PageRank",
+  clustering: "Clustering", kcore: "k-core", community: "Community"
+};
+function nodeTip(d) {
+  const rows = [];
+  rows.push(["Connections", d.deg]);
+  if (S.map.weightCol !== "__count__" || S.map.mode === "co") rows.push(["Total weight", fmt(d.str)]);
+  for (const k of Object.keys(d.attrs)) rows.push([k, d.attrs[k]]);
+  for (const k of ["betweenness", "closeness", "eigenvector", "pagerank", "clustering", "kcore"])
+    if (d.m[k] != null) rows.push([METRIC_LABEL[k], fmt(d.m[k], 4)]);
+  if (d.m.community != null) rows.push(["Community", "#" + (d.m.community + 1)]);
+  return `<div class="t">${esc(d.label)}</div>` +
+    rows.map(([k, v]) => `<div><span class="k">${esc(k)}:</span> ${esc(String(v).slice(0, 120))}</div>`).join("");
+}
+function linkTip(L) {
+  const rows = [["Weight", fmt(L.w)], ["Rows behind it", L.n]];
+  if (L.groups?.length) rows.push([S.map.b, L.groups.slice(0, 8).join("; ") + (L.groups.length > 8 ? ` …(+${L.groups.length - 8})` : "")]);
+  for (const k in L.info) if (!L.groups?.length || k !== S.map.b)
+    rows.push([k, L.info[k].slice(0, 8).join("; ") + (L.info[k].length > 8 ? " …" : "")]);
+  return `<div class="t">${esc(L.source.label)} ${S.map.directed ? "→" : "—"} ${esc(L.target.label)}</div>` +
+    rows.map(([k, v]) => `<div><span class="k">${esc(k)}:</span> ${esc(String(v).slice(0, 160))}</div>`).join("");
+}
+
+/* ------------------------------------------------------------- search --- */
+const searchBox = $("#search"), hits = $("#hits");
+searchBox.addEventListener("input", () => {
+  const q = normKey(searchBox.value);
+  if (!q || !S.G) { hits.style.display = "none"; return; }
+  const found = S.G.nodes.filter(n => n.id.includes(q)).slice(0, 40);
+  hits.innerHTML = found.length
+    ? found.map(n => `<div data-id="${esc(n.id)}">${esc(n.label)} <span style="color:#8a93a2">· ${n.deg} links</span></div>`).join("")
+    : `<div style="color:#8a93a2;cursor:default">No match</div>`;
+  hits.style.display = "block";
+  $$("#hits div[data-id]").forEach(el => el.onclick = () => {
+    focusNode(S.G.byId.get(el.dataset.id));
+    hits.style.display = "none"; searchBox.value = "";
+  });
+});
+searchBox.addEventListener("blur", () => setTimeout(() => hits.style.display = "none", 180));
+
+function focusNode(d) {
+  if (!d) return;
+  S.selected = d;
+  const r = STAGE.getBoundingClientRect();
+  const k = Math.max(S.tf.k, 1.4);
+  d3.select(CANVAS).transition().duration(500).call(zoom.transform,
+    d3.zoomIdentity.translate(r.width / 2 - k * d.x, r.height / 2 - k * d.y).scale(k));
+  renderAnalysisSelection();
+  draw();
+}
+
+/* ------------------------------------------------------------- legend --- */
+function renderLegend() {
+  const el = $("#legend"), key = S.view.colorBy;
+  if (!S.G || key === "__none__") { el.style.display = "none"; return; }
+  let items;
+  if (key === "__community__") {
+    const c = new Map();
+    for (const n of S.G.nodes) { const v = n.m.community; if (v != null) c.set(v, (c.get(v) || 0) + 1); }
+    items = [...c.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20)
+      .map(([v, n]) => ["C" + v, "Community " + (v + 1), PALETTE[v % PALETTE.length], n]);
+  } else {
+    items = valuesOf(key).slice(0, 20).map(([v, n]) => [v, v, S.palette[v] || "#c3cad4", n]);
+  }
+  el.style.display = "block";
+  el.innerHTML = `<h4>${esc(key === "__community__" ? "Communities" : key)}</h4>` +
+    items.map(([id, label, col, n]) =>
+      `<div class="item ${S.view.hidden.has(String(id)) ? "off" : ""}" data-v="${esc(String(id))}">
+         <span class="swatch" style="background:${col}"></span>
+         <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(label)}</span>
+         <span style="color:#8a93a2;font-variant-numeric:tabular-nums">${n}</span>
+       </div>`).join("") +
+    `<div class="hint" style="margin-top:6px">Click a row to hide or show it.</div>`;
+  $$("#legend .item").forEach(it => it.onclick = () => {
+    const v = it.dataset.v;
+    S.view.hidden.has(v) ? S.view.hidden.delete(v) : S.view.hidden.add(v);
+    renderLegend(); renderStatus(); draw();
+  });
+}
+
+/* ------------------------------------------------------ selection tools -- */
+$("#zsel").onclick = () => {
+  S.selectMode = !S.selectMode;
+  $("#zsel").classList.toggle("on", S.selectMode);
+  CANVAS.style.cursor = S.selectMode ? "crosshair" : "default";
+  toast(S.selectMode
+    ? "Marquee select is on — drag a box around the nodes you want. Shift-click adds or removes one node."
+    : "Marquee select is off.");
+};
+
+function pickedNodes() { return S.G ? S.G.nodes.filter(n => S.picked.has(n.id)) : []; }
+
+function renderSelectionBar() {
+  const el = $("#selbar");
+  if (!S.G || !S.picked.size) { el.style.display = "none"; return; }
+  const nodes = pickedNodes();
+  const inside = S.G.links.filter(l => S.picked.has(l.s) && S.picked.has(l.t)).length;
+  el.style.display = "flex";
+  el.innerHTML =
+    `<span><b>${nodes.length}</b> node${nodes.length === 1 ? "" : "s"} marked · ${inside} internal edge${inside === 1 ? "" : "s"}</span>
+     <span class="sep"></span>
+     <button class="acc" id="sb-dl">Download group</button>
+     <button id="sb-grow">+ Neighbours</button>
+     <button id="sb-invert">Invert</button>
+     <button id="sb-iso">${S.view.onlyPicked ? "Show all" : "Isolate"}</button>
+     <button id="sb-clear">Clear</button>`;
+  $("#sb-dl").onclick = () => { showTab("export"); $("#x-sel-nodes")?.scrollIntoView({ block: "center" }); };
+  $("#sb-grow").onclick = () => {
+    for (const id of [...S.picked]) for (const e of S.G.adj.get(id)) S.picked.add(e.o);
+    renderSelectionBar(); renderExportPanel(); draw();
+  };
+  $("#sb-invert").onclick = () => {
+    const inv = new Set(S.G.nodes.filter(n => !S.picked.has(n.id)).map(n => n.id));
+    S.picked = inv; renderSelectionBar(); renderExportPanel(); draw();
+  };
+  $("#sb-iso").onclick = () => {
+    S.view.onlyPicked = !S.view.onlyPicked;
+    renderSelectionBar(); renderStatus(); draw();
+    if (S.view.onlyPicked) fit();
+  };
+  $("#sb-clear").onclick = () => {
+    S.picked.clear(); S.view.onlyPicked = false;
+    renderSelectionBar(); renderExportPanel(); renderStatus(); draw();
+  };
+}
+
+function renderStatus() {
+  if (!S.G) { $("#statusbar").innerHTML = ""; return; }
+  const vn = visibleNodes().length, vl = visibleLinks().length;
+  const bits = [
+    `<span>Nodes <b>${vn.toLocaleString()}</b>${vn !== S.G.nodes.length ? ` / ${S.G.nodes.length.toLocaleString()}` : ""}</span>`,
+    `<span>Edges <b>${vl.toLocaleString()}</b>${vl !== S.G.links.length ? ` / ${S.G.links.length.toLocaleString()}` : ""}</span>`,
+  ];
+  if (S.stats) bits.push(`<span>Density <b>${fmt(S.stats.density, 4)}</b></span>`,
+    `<span>Components <b>${S.stats.components}</b></span>`);
+  if (S.selected) bits.push(`<span style="color:#2f5fd0">Selected <b>${esc(S.selected.label)}</b> — click it again to clear</span>`);
+  if (S.picked.size) bits.push(`<span style="color:#e4572e">Marked <b>${S.picked.size}</b></span>`);
+  bits.push(`<span style="margin-left:auto">Scroll to zoom · drag a node to pin it · shift-drag to mark a group</span>`);
+  $("#statusbar").innerHTML = bits.join("");
+}
+/* ============================================================ METRICS ==== */
+/* A compact CSR-style index so the algorithms run over plain typed arrays. */
+function graphIndex(useThreshold = true) {
+  const nodes = S.G.nodes;
+  const idx = new Map(nodes.map((n, i) => [n.id, i]));
+  const N = nodes.length;
+  const head = Array.from({ length: N }, () => []);
+  const links = useThreshold ? visibleLinks() : S.G.links;
+  for (const L of links) {
+    const a = idx.get(L.s), b = idx.get(L.t);
+    if (a == null || b == null) continue;
+    head[a].push([b, L.w]);
+    if (!(S.map.mode === "edges" && S.map.directed)) head[b].push([a, L.w]);
+    else head[b];                                   // directed: only a → b
+  }
+  return { nodes, idx, N, head, links };
+}
+
+/** Dijkstra / BFS from one source. Returns {dist, sigma, order, preds}. */
+function sssp(head, N, s, weighted) {
+  const dist = new Float64Array(N).fill(Infinity);
+  const sigma = new Float64Array(N);
+  const preds = Array.from({ length: N }, () => []);
+  const order = [];
+  dist[s] = 0; sigma[s] = 1;
+
+  if (!weighted) {
+    const q = [s]; let qi = 0;
+    while (qi < q.length) {
+      const v = q[qi++]; order.push(v);
+      for (const [w] of head[v]) {
+        if (dist[w] === Infinity) { dist[w] = dist[v] + 1; q.push(w); }
+        if (dist[w] === dist[v] + 1) { sigma[w] += sigma[v]; preds[w].push(v); }
+      }
+    }
+    return { dist, sigma, order, preds };
+  }
+  // weighted: shorter distance for a stronger tie → d = 1/w
+  const heap = [[0, s]];
+  const done = new Uint8Array(N);
+  const push = (d, v) => {
+    heap.push([d, v]);
+    let i = heap.length - 1;
+    while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] <= heap[i][0]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; }
+  };
+  const pop = () => {
+    const top = heap[0], last = heap.pop();
+    if (heap.length) {
+      heap[0] = last; let i = 0;
+      for (; ;) {
+        const l = 2 * i + 1, r = l + 1; let m = i;
+        if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
+        if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
+        if (m === i) break;
+        [heap[m], heap[i]] = [heap[i], heap[m]]; i = m;
+      }
+    }
+    return top;
+  };
+  while (heap.length) {
+    const [d, v] = pop();
+    if (done[v]) continue;
+    done[v] = 1; order.push(v);
+    for (const [w, wt] of head[v]) {
+      const nd = d + (wt > 0 ? 1 / wt : 1e9);
+      if (nd < dist[w] - 1e-12) { dist[w] = nd; sigma[w] = sigma[v]; preds[w] = [v]; push(nd, w); }
+      else if (Math.abs(nd - dist[w]) < 1e-12) { sigma[w] += sigma[v]; preds[w].push(v); }
+    }
+  }
+  return { dist, sigma, order, preds };
+}
+
+const METRICS = {
+  betweenness: {
+    name: "Betweenness centrality",
+    heavy: true,
+    run(G, weighted) {
+      const { N, head } = G;
+      const bc = new Float64Array(N);
+      for (let s = 0; s < N; s++) {
+        const { sigma, order, preds } = sssp(head, N, s, weighted);
+        const delta = new Float64Array(N);
+        for (let i = order.length - 1; i >= 0; i--) {
+          const w = order[i];
+          for (const v of preds[w]) delta[v] += (sigma[v] / sigma[w]) * (1 + delta[w]);
+          if (w !== s) bc[w] += delta[w];
+        }
+      }
+      // Undirected traversal visits every pair twice, so the same divisor
+      // normalises both cases and matches NetworkX's normalised values.
+      const scale = N > 2 ? 1 / ((N - 1) * (N - 2)) : 1;
+      const out = {};
+      G.nodes.forEach((n, i) => out[n.id] = bc[i] * scale);
+      return out;
+    }
+  },
+  closeness: {
+    name: "Closeness centrality",
+    heavy: true,
+    run(G, weighted) {
+      const { N, head } = G;
+      const out = {};
+      for (let s = 0; s < N; s++) {
+        const { dist } = sssp(head, N, s, weighted);
+        let sum = 0, reach = 0;
+        for (let i = 0; i < N; i++) if (i !== s && Number.isFinite(dist[i])) { sum += dist[i]; reach++; }
+        // Wasserman–Faust correction so nodes in small components are not flattered
+        out[G.nodes[s].id] = (sum > 0 && N > 1) ? (reach / sum) * (reach / (N - 1)) : 0;
+      }
+      return out;
+    }
+  },
+  eigenvector: {
+    name: "Eigenvector centrality",
+    run(G, weighted) {
+      const { N, head } = G;
+      let x = new Float64Array(N).fill(1 / Math.sqrt(N));
+      for (let it = 0; it < 300; it++) {
+        const y = new Float64Array(N);
+        for (let v = 0; v < N; v++) for (const [w, wt] of head[v]) y[w] += x[v] * (weighted ? wt : 1);
+        let norm = 0; for (let i = 0; i < N; i++) norm += y[i] * y[i]; norm = Math.sqrt(norm);
+        if (!norm || !Number.isFinite(norm)) { norm = 1; }
+        let diff = 0;
+        for (let i = 0; i < N; i++) { const nv = y[i] / norm; diff += Math.abs(nv - x[i]); x[i] = nv; }
+        if (diff < 1e-9) break;
+      }
+      const mx = maxOf(x) || 1;
+      const out = {};
+      G.nodes.forEach((n, i) => out[n.id] = x[i] / mx);
+      return out;
+    }
+  },
+  pagerank: {
+    name: "PageRank",
+    run(G, weighted) {
+      const { N, head } = G, d = 0.85;
+      const outW = new Float64Array(N);
+      for (let v = 0; v < N; v++) for (const [, wt] of head[v]) outW[v] += weighted ? wt : 1;
+      let x = new Float64Array(N).fill(1 / N);
+      for (let it = 0; it < 200; it++) {
+        const y = new Float64Array(N).fill((1 - d) / N);
+        let dangling = 0;
+        for (let v = 0; v < N; v++) {
+          if (outW[v] === 0) { dangling += x[v]; continue; }
+          for (const [w, wt] of head[v]) y[w] += d * x[v] * ((weighted ? wt : 1) / outW[v]);
+        }
+        if (dangling) for (let i = 0; i < N; i++) y[i] += d * dangling / N;
+        let diff = 0;
+        for (let i = 0; i < N; i++) { diff += Math.abs(y[i] - x[i]); }
+        x = y;
+        if (diff < 1e-12) break;
+      }
+      const out = {};
+      G.nodes.forEach((n, i) => out[n.id] = x[i]);
+      return out;
+    }
+  },
+  clustering: {
+    name: "Clustering coefficient",
+    run(G) {
+      const { N, head } = G;
+      const sets = head.map(h => new Set(h.map(e => e[0])));
+      const out = {};
+      for (let v = 0; v < N; v++) {
+        const nb = [...sets[v]].filter(u => u !== v);
+        const k = nb.length;
+        if (k < 2) { out[G.nodes[v].id] = 0; continue; }
+        let tri = 0;
+        for (let i = 0; i < k; i++) for (let j = i + 1; j < k; j++) if (sets[nb[i]].has(nb[j])) tri++;
+        out[G.nodes[v].id] = (2 * tri) / (k * (k - 1));
+      }
+      return out;
+    }
+  },
+  kcore: {
+    name: "k-core",
+    run(G) {
+      const { N, head } = G;
+      const sets = head.map(h => new Set(h.map(e => e[0])));
+      const deg = sets.map((s, i) => { s.delete(i); return s.size; });
+      const core = new Int32Array(N);
+      const alive = new Uint8Array(N).fill(1);
+      const order = [...Array(N).keys()];
+      let k = 0, left = N;
+      while (left > 0) {
+        let changed = true;
+        while (changed) {
+          changed = false;
+          for (const v of order) {
+            if (alive[v] && deg[v] <= k) {
+              alive[v] = 0; core[v] = k; left--; changed = true;
+              for (const u of sets[v]) if (alive[u]) deg[u]--;
+            }
+          }
+        }
+        k++;
+        if (k > N) break;
+      }
+      const out = {};
+      G.nodes.forEach((n, i) => out[n.id] = core[i]);
+      return out;
+    }
+  }
+};
+
+/* ------------------------------------------------------------- Louvain -- */
+function louvain(G) {
+  const { N, head } = G;
+  // collapse to a simple weighted adjacency
+  let adj = head.map(h => {
+    const m = new Map();
+    for (const [w, wt] of h) m.set(w, (m.get(w) || 0) + wt);
+    return m;
+  });
+  let m2 = 0;                                          // 2m
+  for (let v = 0; v < N; v++) for (const [, w] of adj[v]) m2 += w;
+  if (m2 === 0) { const o = {}; G.nodes.forEach(n => o[n.id] = 0); return { comm: o, Q: 0, count: 0 }; }
+
+  let membership = [...Array(N).keys()];               // node -> community at top level
+  let nodeMap = [...Array(N).keys()];                  // original node -> current super-node
+  let n = N;
+
+  for (let level = 0; level < 12; level++) {
+    const k = new Float64Array(n);                     // weighted degree
+    const self = new Float64Array(n);
+    for (let v = 0; v < n; v++) for (const [u, w] of adj[v]) { k[v] += w; if (u === v) self[v] += w; }
+    let comm = [...Array(n).keys()];
+    const sTot = Float64Array.from(k);
+    let improved = false, pass = 0;
+
+    do {
+      improved = false; pass++;
+      const order = [...Array(n).keys()].sort(() => Math.random() - .5);
+      for (const v of order) {
+        const cv = comm[v];
+        sTot[cv] -= k[v];
+        const links = new Map();
+        for (const [u, w] of adj[v]) if (u !== v) links.set(comm[u], (links.get(comm[u]) || 0) + w);
+        let bestC = cv, bestGain = (links.get(cv) || 0) - sTot[cv] * k[v] / m2;
+        for (const [c, w] of links) {
+          const gain = w - sTot[c] * k[v] / m2;
+          if (gain > bestGain + 1e-12) { bestGain = gain; bestC = c; }
+        }
+        sTot[bestC] += k[v];
+        if (bestC !== cv) { comm[v] = bestC; improved = true; }
+      }
+    } while (improved && pass < 40);
+
+    // renumber
+    const remap = new Map();
+    comm = comm.map(c => { if (!remap.has(c)) remap.set(c, remap.size); return remap.get(c); });
+    const nc = remap.size;
+    nodeMap = nodeMap.map(sn => comm[sn]);
+    if (nc === n) break;                               // converged
+
+    // aggregate
+    const nadj = Array.from({ length: nc }, () => new Map());
+    for (let v = 0; v < n; v++) for (const [u, w] of adj[v]) {
+      const a = comm[v], b = comm[u];
+      nadj[a].set(b, (nadj[a].get(b) || 0) + w);
+    }
+    adj = nadj; n = nc;
+  }
+
+  membership = nodeMap;
+  // modularity of the final partition, measured on the original graph
+  const kk = new Float64Array(N);
+  for (let v = 0; v < N; v++) for (const [, w] of head[v].map(e => [e[0], e[1]])) kk[v] += w;
+  const inW = new Map(), totW = new Map();
+  for (let v = 0; v < N; v++) {
+    const c = membership[v];
+    totW.set(c, (totW.get(c) || 0) + kk[v]);
+    for (const [u, w] of head[v]) if (membership[u] === c) inW.set(c, (inW.get(c) || 0) + w);
+  }
+  let Q = 0;
+  for (const [c, tot] of totW) Q += (inW.get(c) || 0) / m2 - (tot / m2) ** 2;
+
+  // order communities by size so #1 is the biggest
+  const size = new Map();
+  for (const c of membership) size.set(c, (size.get(c) || 0) + 1);
+  const rank = new Map([...size.entries()].sort((a, b) => b[1] - a[1]).map(([c], i) => [c, i]));
+  const out = {};
+  G.nodes.forEach((nd, i) => out[nd.id] = rank.get(membership[i]));
+  return { comm: out, Q, count: size.size };
+}
+
+/* -------------------------------------------------------- graph stats --- */
+function graphStats(G, weighted) {
+  const { N, head, links } = G;
+  const directed = S.map.mode === "edges" && S.map.directed;
+  const E = links.length;
+  const density = N > 1 ? (directed ? E / (N * (N - 1)) : 2 * E / (N * (N - 1))) : 0;
+
+  // connected components (weak, for directed)
+  const seen = new Int32Array(N).fill(-1);
+  const comps = [];
+  const undirected = head.map((h, i) => h.map(e => e[0]));
+  if (directed) for (const L of links) {
+    const a = G.idx.get(L.s), b = G.idx.get(L.t);
+    undirected[b].push(a);
+  }
+  for (let s = 0; s < N; s++) {
+    if (seen[s] !== -1) continue;
+    const q = [s]; seen[s] = comps.length; let qi = 0, size = 0;
+    while (qi < q.length) {
+      const v = q[qi++]; size++;
+      for (const w of undirected[v]) if (seen[w] === -1) { seen[w] = comps.length; q.push(w); }
+    }
+    comps.push(size);
+  }
+  comps.sort((a, b) => b - a);
+
+  // path statistics on the largest component (unweighted hops — the intuitive reading)
+  const big = seen.reduce((acc, c, i) => { if (c === 0) acc.push(i); return acc; }, []);
+  let diameter = null, avgPath = null;
+  if (big.length > 1 && big.length <= 3000) {
+    let sum = 0, cnt = 0, dia = 0;
+    for (const s of big) {
+      const { dist } = sssp(head, N, s, false);
+      for (const t of big) if (t !== s && Number.isFinite(dist[t])) { sum += dist[t]; cnt++; if (dist[t] > dia) dia = dist[t]; }
+    }
+    avgPath = cnt ? sum / cnt : null; diameter = dia || null;
+  }
+
+  // global clustering (transitivity)
+  const sets = head.map(h => new Set(h.map(e => e[0])));
+  let triangles = 0, triples = 0;
+  for (let v = 0; v < N; v++) {
+    const nb = [...sets[v]].filter(u => u !== v);
+    triples += nb.length * (nb.length - 1) / 2;
+    for (let i = 0; i < nb.length; i++) for (let j = i + 1; j < nb.length; j++) if (sets[nb[i]].has(nb[j])) triangles++;
+  }
+  const transitivity = triples ? triangles / triples : 0;
+
+  // degree assortativity (Pearson correlation of the degrees at each edge end)
+  let sx = 0, sy = 0, sxy = 0, sx2 = 0, sy2 = 0, n2 = 0;
+  for (const L of links) {
+    const a = sets[G.idx.get(L.s)].size, b = sets[G.idx.get(L.t)].size;
+    sx += a + b; sy += b + a; sxy += 2 * a * b; sx2 += a * a + b * b; sy2 += b * b + a * a; n2 += 2;
+  }
+  const degAssort = n2 ? (sxy / n2 - (sx / n2) * (sy / n2)) /
+    Math.sqrt(Math.max(1e-12, (sx2 / n2 - (sx / n2) ** 2) * (sy2 / n2 - (sy / n2) ** 2))) : null;
+
+  return {
+    N, E, density, components: comps.length, largest: comps[0] || 0,
+    isolates: comps.filter(c => c === 1).length,
+    avgDegree: N ? 2 * E / N : 0, avgPath, diameter, transitivity, degAssort,
+    triangles: triangles / 3
+  };
+}
+
+/** Homophily: how often edges stay inside a category versus crossing it. */
+function homophily(G, key) {
+  const links = G.links;
+  let internal = 0, external = 0, missing = 0;
+  const byVal = new Map();
+  for (const n of G.nodes) {
+    const v = n.attrs[key];
+    if (v == null || v === "") continue;
+    byVal.set(v, (byVal.get(v) || 0) + 1);
+  }
+  const share = new Map([...byVal].map(([v, c]) => [v, c / [...byVal.values()].reduce((a, b) => a + b, 0)]));
+  const perVal = new Map([...byVal.keys()].map(v => [v, { inside: 0, outside: 0 }]));
+  for (const L of links) {
+    const a = L.source.attrs[key], b = L.target.attrs[key];
+    if (a == null || a === "" || b == null || b === "") { missing++; continue; }
+    if (a === b) { internal++; perVal.get(a).inside++; }
+    else { external++; perVal.get(a).outside++; perVal.get(b).outside++; }
+  }
+  const total = internal + external;
+  const EI = total ? (external - internal) / total : null;
+  // expected internal share if links were random, given the category sizes
+  let expInternal = 0;
+  for (const [, p] of share) expInternal += p * p;
+  return {
+    internal, external, missing, total, EI,
+    observed: total ? internal / total : null, expected: expInternal,
+    perVal: [...perVal.entries()].map(([v, o]) => ({
+      value: v, n: byVal.get(v), inside: o.inside, outside: o.outside,
+      rate: (o.inside + o.outside) ? o.inside / (o.inside + o.outside) : null
+    })).sort((a, b) => b.n - a.n)
+  };
+}
+/* ======================================================== STYLE PANEL ==== */
+function renderStylePanel() {
+  const p = $('[data-panel="style"]');
+  if (!S.G) { p.innerHTML = `<p class="hint">Load a network first.</p>`; return; }
+  const V = S.view;
+  const ws = S.G.links.map(l => l.w);
+  const wMin = minOf(ws), wMax = maxOf(ws);
+  const cats = categoricalKeys();
+  const metricOpts = ["degree", "strength", ...Object.keys(METRICS), "kcore"]
+    .filter((v, i, a) => a.indexOf(v) === i)
+    .filter(k => S.metricsDone.has(k) || k === "degree" || k === "strength");
+
+  p.innerHTML = `
+  <div class="sect">
+    <h3>Layout</h3>
+    <div class="row">
+      <select id="s-layout">
+        <option value="force" ${V.layout === "force" ? "selected" : ""}>Force-directed (spring)</option>
+        <option value="communities" ${V.layout === "communities" ? "selected" : ""}>Force, grouped by community</option>
+        <option value="circle" ${V.layout === "circle" ? "selected" : ""}>Circle, ranked by size metric</option>
+        <option value="grid" ${V.layout === "grid" ? "selected" : ""}>Separate clusters per category</option>
+      </select>
+      <p class="hint">Force-directed pulls connected nodes together and pushes everything else apart, so clusters
+        appear on their own. Positions carry no units — only relative closeness means something.</p>
+    </div>
+    <div class="btnrow">
+      <button class="btn sm" id="s-restart">Re-run layout</button>
+      <button class="btn sm" id="s-freeze">Freeze</button>
+      <button class="btn sm" id="s-unpin">Release all pins</button>
+    </div>
+  </div>
+
+  <div class="sect">
+    <h3>Filter</h3>
+    <div class="row">
+      <label>Minimum edge weight <span class="pill" id="s-thlab">${fmt(V.threshold)}</span></label>
+      <div class="slider">
+        <input type="range" id="s-th" min="${wMin}" max="${wMax}" step="${(wMax - wMin) / 100 || 1}" value="${V.threshold}">
+        <output id="s-thout">${visibleLinks().length.toLocaleString()} edges</output>
+      </div>
+      <p class="hint">Hides weak ties. On a dense co-occurrence network this is usually the single most useful
+        control: raise it until the structure becomes readable.</p>
+    </div>
+    <label class="chk"><input type="checkbox" id="s-hideiso" ${V.hideIsolates ? "checked" : ""}>
+      <span>Hide nodes left with no visible edges</span></label>
+  </div>
+
+  <div class="sect">
+    <h3>Colour</h3>
+    <div class="row">
+      <select id="s-color">
+        <option value="__none__" ${V.colorBy === "__none__" ? "selected" : ""}>Single colour</option>
+        <option value="__community__" ${V.colorBy === "__community__" ? "selected" : ""}
+          ${S.metricsDone.has("community") ? "" : "disabled"}>Community (run detection first)</option>
+        ${cats.map(k => `<option value="${esc(k)}" ${V.colorBy === k ? "selected" : ""}>${esc(k)}</option>`).join("")}
+      </select>
+      ${cats.length ? "" : `<p class="hint">No categorical attribute found. Add a node-attribute CSV in the Data tab,
+        or pick node-detail columns in the mapping step.</p>`}
+    </div>
+  </div>
+
+  <div class="sect">
+    <h3>Size</h3>
+    <div class="row">
+      <select id="s-size">
+        <option value="__uniform__" ${V.sizeBy === "__uniform__" ? "selected" : ""}>All the same</option>
+        ${metricOpts.map(k => `<option value="${esc(k)}" ${V.sizeBy === k ? "selected" : ""}>${METRIC_LABEL[k] || k}</option>`).join("")}
+      </select>
+      <p class="hint">Metrics appear here once you compute them in the Analysis tab.</p>
+    </div>
+    <div class="row">
+      <label>Overall scale</label>
+      <div class="slider">
+        <input type="range" id="s-scale" min="0.4" max="3" step="0.05" value="${V.sizeScale}">
+        <output>${V.sizeScale}×</output>
+      </div>
+    </div>
+  </div>
+
+  <div class="sect">
+    <h3>Labels</h3>
+    <div class="row">
+      <select id="s-labmode">
+        <option value="top" ${V.labelMode === "top" ? "selected" : ""}>Only the most central nodes</option>
+        <option value="all" ${V.labelMode === "all" ? "selected" : ""}>All nodes</option>
+        <option value="none" ${V.labelMode === "none" ? "selected" : ""}>None</option>
+      </select>
+    </div>
+    <div class="row" id="s-toprow" style="${V.labelMode === "top" ? "" : "display:none"}">
+      <label>How many</label>
+      <div class="slider">
+        <input type="range" id="s-labtop" min="0" max="${Math.min(300, S.G.nodes.length)}" step="1" value="${V.labelTop}">
+        <output>${V.labelTop}</output>
+      </div>
+    </div>
+    <div class="row">
+      <label>Text size</label>
+      <div class="slider">
+        <input type="range" id="s-labsize" min="6" max="22" step="0.5" value="${V.labelSize}">
+        <output>${V.labelSize}px</output>
+      </div>
+    </div>
+  </div>
+
+  <div class="sect">
+    <h3>Edges &amp; background</h3>
+    <div class="row">
+      <label>Opacity</label>
+      <div class="slider"><input type="range" id="s-eop" min="0.03" max="1" step="0.01" value="${V.edgeOpacity}">
+        <output>${Math.round(V.edgeOpacity * 100)}%</output></div>
+    </div>
+    <div class="row">
+      <label>Thickness</label>
+      <div class="slider"><input type="range" id="s-ew" min="0.2" max="4" step="0.1" value="${V.edgeWidth}">
+        <output>${V.edgeWidth}×</output></div>
+    </div>
+    <label class="chk"><input type="checkbox" id="s-curved" ${V.curved ? "checked" : ""}><span>Curved edges</span></label>
+    <label class="chk"><input type="checkbox" id="s-dark" ${V.dark ? "checked" : ""}><span>Dark background</span></label>
+  </div>`;
+
+  const on = (id, ev, fn) => { const el = $(id); if (el) el.addEventListener(ev, fn); };
+  on("#s-layout", "change", e => runLayout(e.target.value));
+  on("#s-restart", "click", () => runLayout(V.layout));
+  on("#s-freeze", "click", () => { if (S.sim) S.sim.stop(); });
+  on("#s-unpin", "click", () => {
+    S.G.nodes.forEach(n => n.fx = n.fy = null);
+    if (S.sim) S.sim.alpha(.4).restart(); draw();
+  });
+  on("#s-th", "input", e => {
+    V.threshold = +e.target.value;
+    $("#s-thlab").textContent = fmt(V.threshold);
+    $("#s-thout").textContent = visibleLinks().length.toLocaleString() + " edges";
+    renderStatus(); draw();
+  });
+  on("#s-th", "change", () => { if (V.layout === "force" || V.layout === "communities") runLayout(V.layout); });
+  on("#s-hideiso", "change", e => { V.hideIsolates = e.target.checked; renderStatus(); draw(); });
+  on("#s-color", "change", e => { V.colorBy = e.target.value; applyColours(); V.hidden.clear(); renderLegend(); draw(); });
+  on("#s-size", "change", e => { V.sizeBy = e.target.value; draw(); });
+  on("#s-scale", "input", e => { V.sizeScale = +e.target.value; e.target.nextElementSibling.textContent = V.sizeScale + "×"; draw(); });
+  on("#s-labmode", "change", e => { V.labelMode = e.target.value; $("#s-toprow").style.display = e.target.value === "top" ? "" : "none"; draw(); });
+  on("#s-labtop", "input", e => { V.labelTop = +e.target.value; e.target.nextElementSibling.textContent = V.labelTop; draw(); });
+  on("#s-labsize", "input", e => { V.labelSize = +e.target.value; e.target.nextElementSibling.textContent = V.labelSize + "px"; draw(); });
+  on("#s-eop", "input", e => { V.edgeOpacity = +e.target.value; e.target.nextElementSibling.textContent = Math.round(V.edgeOpacity * 100) + "%"; draw(); });
+  on("#s-ew", "input", e => { V.edgeWidth = +e.target.value; e.target.nextElementSibling.textContent = V.edgeWidth + "×"; draw(); });
+  on("#s-curved", "change", e => { V.curved = e.target.checked; draw(); });
+  on("#s-dark", "change", e => { V.dark = e.target.checked; draw(); });
+}
+
+/* ===================================================== ANALYSIS PANEL ==== */
+const EXPLAIN = {
+  degree: `<b>What it counts.</b> How many other nodes this one is directly connected to.
+    <span class="formula">degree(v) = number of neighbours of v</span>
+    <b>Read it as</b> raw activity or visibility. A person in many documents scores high even if all those
+    documents belong to one tight circle.
+    <b>Watch out.</b> It is local: it says nothing about <em>where</em> in the network the node sits.`,
+  strength: `<b>What it counts.</b> The same as degree, but each connection counts its weight instead of 1.
+    <span class="formula">strength(v) = Σ weight of v's edges</span>
+    <b>Read it as</b> total volume of contact. Two people who co-appear in nine documents contribute 9, not 1.`,
+  betweenness: `<b>What it counts.</b> How often a node sits on the shortest path between two others.
+    For every pair of nodes the algorithm (Brandes 2001) finds all shortest paths and gives each intermediate
+    node a share of the credit.
+    <span class="formula">betweenness(v) = Σ (paths s→t through v ÷ all paths s→t)</span>
+    <b>Read it as</b> brokerage. A high score means the node is a bridge: remove it and parts of the network
+    get further apart or fall out of contact altogether.
+    <b>Watch out.</b> A node can have few connections and still be the highest broker, if its few connections
+    are the only route between two groups. Values are normalised to 0–1.`,
+  closeness: `<b>What it counts.</b> How short the paths are from this node to every other node it can reach.
+    <span class="formula">closeness(v) = (reachable ÷ Σ distance) × (reachable ÷ (n−1))</span>
+    <b>Read it as</b> reach — how quickly something starting here would arrive everywhere else.
+    <b>Watch out.</b> Only reachable nodes count, so the score is corrected by how much of the network the node
+    can actually reach (the Wasserman–Faust correction); otherwise a node in a tiny isolated pair would look ideal.`,
+  eigenvector: `<b>What it counts.</b> Connection to well-connected nodes. Each node's score is proportional to
+    the sum of its neighbours' scores, solved by repeated iteration until it stops changing.
+    <span class="formula">x(v) ∝ Σ x(neighbours of v)</span>
+    <b>Read it as</b> being in the middle of the influential core, not just having many links.
+    <b>Watch out.</b> It concentrates on the largest component and can give almost zero to everything outside it.
+    Scores are rescaled so the top node is 1.`,
+  pagerank: `<b>What it counts.</b> A random walker moves along edges, and 15% of the time jumps to a random
+    node instead. PageRank is the share of time it spends at each node.
+    <span class="formula">PR(v) = 0.15/n + 0.85 × Σ PR(u)/out-weight(u)</span>
+    <b>Read it as</b> a steadier version of eigenvector centrality. The random jump keeps small components and
+    weakly connected nodes from collapsing to zero, so it behaves better on fragmented networks.
+    <b>Watch out.</b> All scores add up to 1, so they shrink as the network grows — compare ranks, not raw values.`,
+  clustering: `<b>What it counts.</b> Of all the pairs of a node's neighbours, what fraction are connected to
+    each other.
+    <span class="formula">C(v) = 2 × (links among neighbours) ÷ (k × (k−1))</span>
+    <b>Read it as</b> how closed the node's local world is. 1 means everyone it knows also knows each other;
+    0 means it is the only thing holding its contacts together.
+    <b>Watch out.</b> In a co-occurrence network every group becomes a fully connected clique, so clustering
+    is inflated by construction and should be compared between nodes, not read as an absolute.`,
+  kcore: `<b>What it counts.</b> Repeatedly strip away every node with fewer than k connections. A node's core
+    number is the highest k at which it survives.
+    <b>Read it as</b> depth inside the dense heart of the network. Peripheral nodes fall out early; the highest
+    core is the tightly interlocked centre.
+    <b>Watch out.</b> It ignores weights and is a property of a whole layer of nodes, not of one node alone.`,
+  community: `<b>What a community is.</b> A set of nodes that are densely connected <em>to each other</em> and
+    only sparsely connected to the rest of the network. Nothing about the nodes themselves defines it — not their
+    attributes, not their labels, only the pattern of links. The network is cut where the links are thin.
+    <b>Why it is worth doing.</b> It answers "does this network fall into distinct circles, and who belongs to
+    which?" without you deciding the categories in advance. That makes it a genuine finding rather than a
+    restatement of what you already coded: if the communities line up with a category you recorded separately —
+    a family, a place, a period, a sect — that alignment is evidence. If they cut across it, that is evidence too.
+    <b>How it is found.</b> The Louvain method starts with every node in its own group, then repeatedly moves each
+    node into whichever neighbouring group most improves <em>modularity</em>, collapses each group into a single
+    node, and starts again — until nothing improves.
+    <span class="formula">Q = Σ over communities [ (edges inside c ÷ all edges) − (total degree of c ÷ 2 × all edges)² ]</span>
+    <b>Reading modularity Q.</b> It compares the links found inside the groups against the number you would expect
+    if the same nodes were wired at random. Roughly: below 0.3 the division is weak and probably not worth
+    interpreting; 0.3–0.7 is ordinary, real community structure; above 0.7 usually means the network is already
+    broken into near-separate pieces.
+    <b>Watch out.</b> (1) The method is randomised — re-running it can move borderline nodes between groups, though
+    Q stays stable. (2) Every node is forced into exactly one community; real people belong to several. (3) It will
+    always return communities, even in a random graph — Q is what tells you whether they mean anything.
+    (4) In a co-occurrence network each shared group is already a fully connected clique, so communities often
+    trace the documents or events themselves rather than anything deeper. That is worth checking before
+    interpreting them as social circles.`,
+  homophily: `<b>What it measures.</b> Whether edges tend to stay inside a category or cross between categories.
+    <span class="formula">E–I index = (crossing − internal) ÷ all edges</span>
+    <b>Read it as</b> −1 means every tie is inside a category (complete separation); +1 means every tie crosses
+    (complete mixing); 0 is the balance point. Compare the observed internal share against the expected share,
+    which is what you would get if edges ignored the categories entirely.
+    <b>Watch out.</b> Category sizes drive the expectation: in a group that is 90% one category, most ties will
+    be internal by chance alone, which is exactly what the expected value corrects for.`
+};
+
+function renderAnalysisPanel() {
+  const p = $('[data-panel="analysis"]');
+  if (!S.G) { p.innerHTML = `<p class="hint">Load a network first.</p>`; return; }
+  const heavy = S.G.nodes.length > 1200;
+  const cats = categoricalKeys();
+  const st = S.stats;
+
+  p.innerHTML = `
+  <div class="sect">
+    <h3>Overview</h3>
+    ${st ? `
+      <div class="stat"><span>Nodes / edges</span><b>${st.N.toLocaleString()} / ${st.E.toLocaleString()}</b></div>
+      <div class="stat"><span>Density</span><b>${fmt(st.density, 4)}</b></div>
+      <div class="stat"><span>Average degree</span><b>${fmt(st.avgDegree, 2)}</b></div>
+      <div class="stat"><span>Components</span><b>${st.components}</b></div>
+      <div class="stat"><span>Largest component</span><b>${st.largest} (${fmt(100 * st.largest / st.N, 1)}%)</b></div>
+      <div class="stat"><span>Isolated nodes</span><b>${st.isolates}</b></div>
+      <div class="stat"><span>Average path length</span><b>${st.avgPath == null ? "—" : fmt(st.avgPath, 2)}</b></div>
+      <div class="stat"><span>Diameter</span><b>${st.diameter ?? "—"}</b></div>
+      <div class="stat"><span>Transitivity</span><b>${fmt(st.transitivity, 3)}</b></div>
+      <div class="stat"><span>Degree assortativity</span><b>${st.degAssort == null ? "—" : fmt(st.degAssort, 3)}</b></div>
+      <p class="hint" style="margin-top:8px">Density is the share of all possible links that exist.
+        Path length and diameter are counted in hops within the largest component.
+        Degree assortativity is positive when hubs attach to hubs and negative when hubs attach to the periphery.</p>`
+      : `<button class="btn wide" id="a-stats">Compute overview</button>`}
+  </div>
+
+  <div class="sect">
+    <h3>Centrality &amp; structure</h3>
+    <label class="chk"><input type="checkbox" id="a-weighted" ${S.useWeights ? "checked" : ""}>
+      <span>Use edge weights (a heavier tie counts as a <i>shorter</i> distance)</span></label>
+    <button class="btn primary wide" id="a-all" style="margin:8px 0 10px">
+      Compute all metrics${heavy ? " (slow on this size)" : ""}</button>
+    ${heavy ? `<div class="note warn" style="margin-bottom:10px">${S.G.nodes.length.toLocaleString()} nodes —
+      betweenness and closeness examine every pair, so this may take a while. Raising the weight threshold first
+      makes it much faster.</div>` : ""}
+    <div id="a-metrics">
+      ${["betweenness", "closeness", "eigenvector", "pagerank", "clustering", "kcore"].map(k => metricCard(k)).join("")}
+    </div>
+  </div>
+
+  <div class="sect">
+    <h3>Communities <span class="pill">grouping</span></h3>
+    ${S.metricsDone.has("community") ? `
+      <div class="stat"><span>Communities found</span><b>${S.communityCount}</b></div>
+      <div class="stat"><span>Modularity Q</span><b>${fmt(S.modularity, 3)}</b></div>
+      <div class="stat"><span>Largest</span><b>${communityList()[0] ? Math.max(...communityList().map(c => c.size)) + " nodes" : "—"}</b></div>
+      <div class="note" style="margin:9px 0">${S.modularity < 0.3
+      ? "Q below 0.3 — the split is weak. Treat these groups with caution."
+      : S.modularity > 0.7
+        ? "Q above 0.7 — the network is close to being separate pieces already, so the split is unsurprising."
+        : "Q in the usual range for a real community structure."}</div>
+      <div class="btnrow">
+        <button class="btn sm" id="a-comm-rerun">Run again</button>
+        <button class="btn sm" id="a-comm-colour">Colour the graph by community</button>
+      </div>`
+      : `<button class="btn wide" id="a-comm-run" style="margin-bottom:9px">Detect communities</button>`}
+    <div class="metric open" id="card-community" style="margin-top:9px">
+      <button onclick="this.parentElement.classList.toggle('open')">
+        <b>What is a community?</b><span class="caret">›</span></button>
+      <div class="why">${EXPLAIN.community}</div>
+    </div>
+  </div>
+
+  <div class="sect">
+    <h3>Homophily <span class="pill">who links to whom</span></h3>
+    ${cats.length ? `
+      <div class="row">
+        <select id="a-homokey">
+          <option value="">Choose an attribute…</option>
+          ${cats.map(k => `<option value="${esc(k)}" ${S.homoKey === k ? "selected" : ""}>${esc(k)}</option>`).join("")}
+        </select>
+      </div>
+      <div id="a-homo"></div>`
+      : `<p class="hint">Needs a categorical node attribute. Add one from a second CSV in the Data tab.</p>`}
+    <div class="metric" id="card-homophily" style="margin-top:8px">
+      <button onclick="this.parentElement.classList.toggle('open')">
+        <b>How this is measured</b><span class="caret">›</span></button>
+      <div class="why">${EXPLAIN.homophily}</div>
+    </div>
+  </div>
+
+  <div class="sect">
+    <h3>Ranking</h3>
+    <div class="row">
+      <select id="a-rankby"></select>
+    </div>
+    <div class="tblwrap" id="a-table"><p class="hint" style="padding:10px">Compute a metric to see the ranking.</p></div>
+    <div class="btnrow" style="margin-top:8px">
+      <button class="btn sm" id="a-marktop">Mark the top 20</button>
+      <button class="btn sm" id="a-markclear">Clear marks</button>
+    </div>
+    <p class="hint">Click a row to jump to that node; shift-click to mark it for export.</p>
+  </div>
+
+  <div class="sect">
+    <h3>Selected node</h3>
+    <div id="a-sel"><p class="hint">Click a node on the canvas to inspect it.</p></div>
+  </div>`;
+
+  const stBtn = $("#a-stats");
+  if (stBtn) stBtn.onclick = async () => {
+    busy(true, "Measuring the network…"); await nextFrame();
+    S.stats = graphStats(graphIndex(), S.useWeights);
+    busy(false); renderAnalysisPanel(); renderStatus();
+  };
+  $("#a-weighted").onchange = e => { S.useWeights = e.target.checked; };
+  $("#a-all").onclick = () => runMetrics(["betweenness", "closeness", "eigenvector", "pagerank", "clustering", "kcore", "community"]);
+  $$("#a-metrics .run").forEach(b => b.onclick = e => { e.stopPropagation(); runMetrics([b.dataset.k]); });
+  const commRun = $("#a-comm-run") || $("#a-comm-rerun");
+  if (commRun) commRun.onclick = () => runMetrics(["community"]);
+  const commCol = $("#a-comm-colour");
+  if (commCol) commCol.onclick = () => {
+    S.view.colorBy = "__community__"; applyColours(); S.view.hidden.clear();
+    renderStylePanel(); renderLegend(); draw();
+  };
+
+  const rank = $("#a-rankby");
+  const done = [...S.metricsDone];
+  rank.innerHTML = done.map(k => `<option value="${esc(k)}" ${S.rankBy === k ? "selected" : ""}>${METRIC_LABEL[k] || k}</option>`).join("");
+  rank.onchange = () => { S.rankBy = rank.value; renderRanking(); };
+  S.rankBy = S.rankBy && done.includes(S.rankBy) ? S.rankBy : done[done.length - 1];
+  rank.value = S.rankBy;
+  renderRanking();
+
+  const hk = $("#a-homokey");
+  if (hk) hk.onchange = () => { S.homoKey = hk.value; renderHomophily(); };
+  renderHomophily();
+  renderAnalysisSelection();
+}
+
+function metricCard(k) {
+  const done = S.metricsDone.has(k);
+  return `<div class="metric" id="card-${k}">
+    <button onclick="this.parentElement.classList.toggle('open')">
+      <b>${METRIC_LABEL[k] || k}${done ? " ✓" : ""}</b>
+      <span style="display:flex;align-items:center;gap:8px">
+        ${done ? "" : `<span class="btn sm run" data-k="${k}" style="padding:3px 8px">Compute</span>`}
+        <span class="caret">›</span></span>
+    </button>
+    <div class="why">${EXPLAIN[k] || ""}${done && k === "community"
+      ? `<div style="margin-top:8px" class="note">Found <b>${S.communityCount}</b> communities ·
+         modularity Q = <b>${fmt(S.modularity, 3)}</b></div>` : ""}</div>
+  </div>`;
+}
+
+async function runMetrics(keys) {
+  busy(true, "Computing…"); await nextFrame();
+  const G = graphIndex();
+  const weighted = !!S.useWeights;
+  for (const k of keys) {
+    busy(true, `Computing ${METRIC_LABEL[k] || k}…`); await nextFrame();
+    if (k === "community") {
+      const { comm, Q, count } = louvain(G);
+      for (const n of S.G.nodes) n.m.community = comm[n.id];
+      S.modularity = Q; S.communityCount = count;
+    } else {
+      const res = METRICS[k].run(G, weighted);
+      for (const n of S.G.nodes) n.m[k] = res[n.id] ?? 0;
+    }
+    S.metricsDone.add(k);
+  }
+  if (!S.stats) S.stats = graphStats(G, weighted);
+  refreshSizeExtent();
+  busy(false);
+  renderAll(); draw();
+}
+
+function renderRanking() {
+  const box = $("#a-table");
+  if (!box) return;
+  const k = S.rankBy;
+  if (!k || !S.metricsDone.has(k)) { box.innerHTML = `<p class="hint" style="padding:10px">Compute a metric to see the ranking.</p>`; return; }
+  const rows = [...S.G.nodes].sort((a, b) => (b.m[k] ?? 0) - (a.m[k] ?? 0)).slice(0, 200);
+  const colorKey = S.view.colorBy !== "__none__" && S.view.colorBy !== "__community__" ? S.view.colorBy : null;
+  box.innerHTML = `<table><thead><tr>
+      <th>#</th><th>Node</th><th class="num">${esc(METRIC_LABEL[k] || k)}</th><th class="num">deg</th><th title="marked for export"></th>
+      ${colorKey ? `<th>${esc(colorKey)}</th>` : ""}</tr></thead>
+    <tbody>${rows.map((n, i) => `<tr data-id="${esc(n.id)}">
+      <td class="num" style="color:#8a93a2">${i + 1}</td>
+      <td>${esc(n.label)}</td>
+      <td class="num">${k === "community" ? "#" + (n.m[k] + 1) : fmt(n.m[k], 4)}</td>
+      <td class="num">${n.deg}</td>
+      <td>${S.picked.has(n.id) ? "<span style='color:#e4572e;font-weight:700'>&#9679;</span>" : ""}</td>
+      ${colorKey ? `<td>${esc(String(n.attrs[colorKey] ?? "—").slice(0, 28))}</td>` : ""}
+    </tr>`).join("")}</tbody></table>`;
+  $$("#a-table tr[data-id]").forEach(tr => tr.onclick = ev => {
+    const id = tr.dataset.id;
+    if (ev.shiftKey || ev.metaKey || ev.ctrlKey) {
+      S.picked.has(id) ? S.picked.delete(id) : S.picked.add(id);
+      renderSelectionBar(); renderExportPanel(); renderRanking(); draw();
+    } else focusNode(S.G.byId.get(id));
+  });
+  const mt = $("#a-marktop");
+  if (mt) mt.onclick = () => {
+    rows.slice(0, 20).forEach(n => S.picked.add(n.id));
+    renderSelectionBar(); renderExportPanel(); renderRanking(); renderStatus(); draw();
+  };
+  const mc = $("#a-markclear");
+  if (mc) mc.onclick = () => {
+    S.picked.clear(); S.view.onlyPicked = false;
+    renderSelectionBar(); renderExportPanel(); renderRanking(); renderStatus(); draw();
+  };
+}
+
+function renderHomophily() {
+  const box = $("#a-homo");
+  if (!box) return;
+  const key = S.homoKey;
+  if (!key) { box.innerHTML = ""; return; }
+  const h = homophily(S.G, key);
+  const dir = h.EI == null ? "" : h.EI < -0.2 ? "strongly inward-facing"
+    : h.EI < 0 ? "leaning inward" : h.EI < 0.2 ? "close to balanced" : "strongly outward-facing";
+  box.innerHTML = `
+    <div class="stat"><span>Ties inside a category</span><b>${h.internal.toLocaleString()}</b></div>
+    <div class="stat"><span>Ties crossing categories</span><b>${h.external.toLocaleString()}</b></div>
+    <div class="stat"><span>E–I index</span><b>${fmt(h.EI, 3)}</b></div>
+    <div class="stat"><span>Internal share, observed</span><b>${fmt(100 * h.observed, 1)}%</b></div>
+    <div class="stat"><span>Internal share, expected by chance</span><b>${fmt(100 * h.expected, 1)}%</b></div>
+    ${h.missing ? `<div class="stat"><span>Edges skipped (value missing)</span><b>${h.missing}</b></div>` : ""}
+    <div class="note" style="margin:9px 0">The network is <b>${dir}</b> on “${esc(key)}”.
+      ${h.observed > h.expected + 0.02
+      ? `Ties stay inside a category more often than category sizes alone would produce.`
+      : h.observed < h.expected - 0.02
+        ? `Ties cross categories more often than category sizes alone would produce.`
+        : `That is about what the category sizes alone would produce.`}</div>
+    <div class="tblwrap" style="max-height:180px"><table>
+      <thead><tr><th>${esc(key)}</th><th class="num">nodes</th><th class="num">internal ties</th><th class="num">% internal</th></tr></thead>
+      <tbody>${h.perVal.slice(0, 25).map(r => `<tr style="cursor:default">
+        <td>${esc(String(r.value).slice(0, 30))}</td><td class="num">${r.n}</td>
+        <td class="num">${r.inside}</td><td class="num">${r.rate == null ? "—" : fmt(100 * r.rate, 1) + "%"}</td></tr>`).join("")}
+      </tbody></table></div>`;
+}
+
+function renderAnalysisSelection() {
+  const box = $("#a-sel");
+  renderStatus();
+  if (!box) return;
+  const d = S.selected;
+  if (!d) { box.innerHTML = `<p class="hint">Click a node on the canvas to inspect it.</p>`; return; }
+  const nbrs = S.G.adj.get(d.id).map(e => ({ n: S.G.byId.get(e.o), w: e.w }))
+    .sort((a, b) => b.w - a.w).slice(0, 12);
+  const pct = k => {
+    if (d.m[k] == null) return "";
+    const all = S.G.nodes.map(n => n.m[k] ?? 0).sort((a, b) => a - b);
+    const r = all.filter(v => v < d.m[k]).length / Math.max(1, all.length - 1);
+    return ` <span style="color:#8a93a2">(top ${fmt(100 * (1 - r), 0)}%)</span>`;
+  };
+  box.innerHTML = `
+    <div style="font-weight:650;margin-bottom:6px">${esc(d.label)}</div>
+    <div class="stat"><span>Connections</span><b>${d.deg}</b></div>
+    <div class="stat"><span>Total weight</span><b>${fmt(d.str)}</b></div>
+    ${Object.keys(d.attrs).map(k => `<div class="stat"><span>${esc(k)}</span><b style="font-weight:500;max-width:60%;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(String(d.attrs[k]))}</b></div>`).join("")}
+    ${[...S.metricsDone].filter(k => k !== "degree" && k !== "strength" && d.m[k] != null).map(k =>
+      `<div class="stat"><span>${esc(METRIC_LABEL[k] || k)}</span><b>${k === "community" ? "#" + (d.m[k] + 1) : fmt(d.m[k], 4)}${k === "community" ? "" : pct(k)}</b></div>`).join("")}
+    <div style="margin-top:10px;font-size:12px;font-weight:600">Strongest connections</div>
+    <div class="tblwrap" style="max-height:170px;margin-top:5px"><table><tbody>
+      ${nbrs.map(x => `<tr data-id="${esc(x.n.id)}"><td>${esc(x.n.label)}</td><td class="num">${fmt(x.w)}</td></tr>`).join("")}
+    </tbody></table></div>
+    <button class="btn sm wide" id="a-clearsel" style="margin-top:8px">Clear selection</button>`;
+  $$("#a-sel tr[data-id]").forEach(tr => tr.onclick = () => focusNode(S.G.byId.get(tr.dataset.id)));
+  $("#a-clearsel").onclick = () => { S.selected = null; renderAnalysisSelection(); draw(); };
+}
+/* ======================================================= EXPORT PANEL ==== */
+function renderExportPanel() {
+  const p = $('[data-panel="export"]');
+  if (!S.G) { p.innerHTML = `<p class="hint">Load a network first.</p>`; return; }
+  p.innerHTML = `
+  <div class="sect">
+    <h3>Picture of the current view</h3>
+    <p class="hint" style="margin-bottom:9px">Exports exactly what you see on screen — same zoom, same pan,
+      same filters and labels. Arrange the view first, then export.</p>
+    <div class="row">
+      <label>Resolution</label>
+      <select id="x-scale">
+        <option value="2">2× — good for slides</option>
+        <option value="3" selected>3× — good for print</option>
+        <option value="4">4× — very large</option>
+        <option value="6">6× — poster size</option>
+      </select>
+      <p class="hint" id="x-dims"></p>
+    </div>
+    <label class="chk"><input type="checkbox" id="x-trans"><span>Transparent background (PNG only)</span></label>
+    <div class="btnrow" style="margin-top:9px">
+      <button class="btn primary" id="x-png">Save PNG</button>
+      <button class="btn" id="x-svg">Save SVG</button>
+    </div>
+    <p class="hint">SVG stays sharp at any size and can be edited in Illustrator or Inkscape — the better choice
+      for a figure in a paper. PNG is a plain image, easier to drop into slides or a document.</p>
+  </div>
+
+  <div class="sect">
+    <h3>Data</h3>
+    <div class="btnrow">
+      <button class="btn sm" id="x-nodes">Nodes + metrics (CSV)</button>
+      <button class="btn sm" id="x-edges">Edges (CSV)</button>
+    </div>
+    <p class="hint">Every computed metric is included, so you can carry the numbers into Excel, R or Python.</p>
+  </div>
+
+  <div class="sect">
+    <h3>Marked group <span class="pill">${S.picked.size} selected</span></h3>
+    ${S.picked.size ? `
+      <p class="hint" style="margin-bottom:9px">${S.picked.size} nodes and
+        ${S.G.links.filter(l => S.picked.has(l.s) && S.picked.has(l.t)).length} edges between them.</p>
+      <div class="btnrow">
+        <button class="btn sm" id="x-sel-nodes">Nodes (CSV)</button>
+        <button class="btn sm" id="x-sel-edges">Edges within the group (CSV)</button>
+        <button class="btn sm" id="x-sel-ties">Ties to the outside (CSV)</button>
+      </div>
+      <p class="hint">The edge file can be uploaded back into this tool as an edge list, so you can analyse the
+        group on its own — its own centralities, its own communities.</p>`
+      : `<p class="hint">Nothing marked yet. On the canvas, hold <b>Shift</b> and drag a box around the nodes you
+         want — or shift-click them one at a time. The <b>▨</b> button above the canvas turns box-select on
+         permanently.</p>`}
+  </div>
+
+  <div class="sect">
+    <h3>Communities</h3>
+    ${S.metricsDone.has("community") ? `
+      <div class="row">
+        <label>One community on its own</label>
+        <select id="x-comm">
+          ${communityList().map(c => `<option value="${c.id}">Community #${c.id + 1} — ${c.size} nodes${c.top ? ` (${esc(c.top)}…)` : ""}</option>`).join("")}
+        </select>
+      </div>
+      <div class="btnrow" style="margin-bottom:10px">
+        <button class="btn sm" id="x-comm-nodes">Its nodes (CSV)</button>
+        <button class="btn sm" id="x-comm-edges">Its edges (CSV)</button>
+        <button class="btn sm" id="x-comm-mark">Mark it on the canvas</button>
+      </div>
+      <div class="btnrow">
+        <button class="btn sm" id="x-comm-all">All nodes, grouped by community (CSV)</button>
+        <button class="btn sm" id="x-comm-summary">Community summary (CSV)</button>
+        <button class="btn sm" id="x-comm-edges-all">All edges, labelled by community (CSV)</button>
+      </div>
+      <p class="hint">The summary has one row per community: size, internal and external ties, density, and its
+        most central members — the quickest way to see what each group actually is.</p>`
+      : `<p class="hint">Run <b>Community</b> detection in the Analysis tab first.</p>`}
+  </div>
+
+  <div class="sect">
+    <h3>For other software</h3>
+    <div class="btnrow">
+      <button class="btn sm" id="x-gexf">GEXF (Gephi)</button>
+      <button class="btn sm" id="x-graphml">GraphML (Gephi, igraph, NetworkX)</button>
+    </div>
+    <p class="hint">Carries node positions, attributes, metrics and edge weights across.</p>
+  </div>
+
+  <div class="sect">
+    <h3>Session</h3>
+    <button class="btn wide" id="x-session">Save session (.json)</button>
+    <p class="hint">Stores the column mapping, every setting and the exact node positions. Re-open it from the
+      Data tab to reproduce this figure precisely — useful when a reviewer asks how a figure was made.</p>
+  </div>
+
+  <div class="sect">
+    <h3>Methods note</h3>
+    <button class="btn sm wide" id="x-methods">Copy a methods paragraph</button>
+    <p class="hint">A short description of what was computed, ready to paste into a paper and edit.</p>
+  </div>`;
+
+  const dims = () => {
+    const r = STAGE.getBoundingClientRect(), s = +$("#x-scale").value;
+    $("#x-dims").textContent = `${Math.round(r.width * s)} × ${Math.round(r.height * s)} pixels`;
+  };
+  $("#x-scale").onchange = dims; dims();
+
+  $("#x-png").onclick = () => exportPNG(+$("#x-scale").value, $("#x-trans").checked);
+  $("#x-svg").onclick = exportSVG;
+
+  if (S.picked.size) {
+    $("#x-sel-nodes").onclick = () => exportSubsetNodes(S.picked, "selection");
+    $("#x-sel-edges").onclick = () => exportSubsetEdges(S.picked, "selection", false);
+    $("#x-sel-ties").onclick = () => exportSubsetEdges(S.picked, "selection_boundary", true);
+  }
+  if (S.metricsDone.has("community")) {
+    const cur = () => +$("#x-comm").value;
+    const members = c => new Set(S.G.nodes.filter(n => n.m.community === c).map(n => n.id));
+    $("#x-comm-nodes").onclick = () => exportSubsetNodes(members(cur()), "community_" + (cur() + 1));
+    $("#x-comm-edges").onclick = () => exportSubsetEdges(members(cur()), "community_" + (cur() + 1), false);
+    $("#x-comm-mark").onclick = () => {
+      S.picked = members(cur());
+      renderSelectionBar(); renderExportPanel(); renderStatus(); draw();
+      toast(`Community #${cur() + 1} marked on the canvas.`);
+    };
+    $("#x-comm-all").onclick = exportNodesByCommunity;
+    $("#x-comm-summary").onclick = exportCommunitySummary;
+    $("#x-comm-edges-all").onclick = exportEdgesByCommunity;
+  }
+  $("#x-nodes").onclick = exportNodesCSV;
+  $("#x-edges").onclick = exportEdgesCSV;
+  $("#x-gexf").onclick = exportGEXF;
+  $("#x-graphml").onclick = exportGraphML;
+  $("#x-session").onclick = saveSession;
+  $("#x-methods").onclick = copyMethods;
+}
+
+const stamp = () => new Date().toISOString().slice(0, 10);
+const baseName = () => (S.raw?.name || "network").replace(/\.[^.]+$/, "").replace(/[^\w\-]+/g, "_");
+
+function exportPNG(scale = 3, transparent = false) {
+  const r = STAGE.getBoundingClientRect();
+  const c = document.createElement("canvas");
+  c.width = Math.round(r.width * scale);
+  c.height = Math.round(r.height * scale);
+  const ctx = c.getContext("2d");
+  if (!transparent) {
+    ctx.fillStyle = S.view.dark ? "#12161c" : "#ffffff";
+    ctx.fillRect(0, 0, c.width, c.height);
+  }
+  ctx.scale(scale, scale);
+  ctx.translate(S.tf.x, S.tf.y);
+  ctx.scale(S.tf.k, S.tf.k);
+  paint(ctx, S.tf.k);
+  c.toBlob(b => download(`${baseName()}_${stamp()}.png`, b), "image/png");
+}
+
+function exportSVG() {
+  const r = STAGE.getBoundingClientRect();
+  const W = Math.round(r.width), H = Math.round(r.height);
+  const t = S.tf, k = t.k;
+  const X = d => d.x * k + t.x, Y = d => d.y * k + t.y;
+  const links = visibleLinks(), nodes = visibleNodes();
+  const ego = S.selected ? new Set([S.selected.id, ...S.G.adj.get(S.selected.id).map(e => e.o)]) : null;
+  const maxW = Math.max(1, maxOf(links, l => l.w));
+  const V = S.view;
+  const out = [];
+
+  out.push(`<?xml version="1.0" encoding="UTF-8"?>`);
+  out.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`);
+  out.push(`<rect width="${W}" height="${H}" fill="${V.dark ? "#12161c" : "#ffffff"}"/>`);
+  out.push(`<g id="edges" fill="none" stroke-linecap="round" stroke="${V.dark ? "#8fa3bd" : "#6f7d90"}">`);
+  for (const L of links) {
+    const dim = ego && !(ego.has(L.s) && ego.has(L.t));
+    const op = dim ? V.edgeOpacity * .12 : V.edgeOpacity;
+    const sw = (0.35 + 2.4 * Math.sqrt(L.w / maxW)) * V.edgeWidth;
+    const x1 = X(L.source), y1 = Y(L.source), x2 = X(L.target), y2 = Y(L.target);
+    if (V.curved) {
+      const mx = (x1 + x2) / 2, my = (y1 + y2) / 2, dx = x2 - x1, dy = y2 - y1;
+      out.push(`<path d="M${x1.toFixed(1)},${y1.toFixed(1)} Q${(mx - dy * .12).toFixed(1)},${(my + dx * .12).toFixed(1)} ${x2.toFixed(1)},${y2.toFixed(1)}" stroke-width="${sw.toFixed(2)}" opacity="${op.toFixed(3)}"/>`);
+    } else {
+      out.push(`<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke-width="${sw.toFixed(2)}" opacity="${op.toFixed(3)}"/>`);
+    }
+  }
+  out.push(`</g><g id="nodes" stroke="${V.dark ? "rgba(255,255,255,.35)" : "#ffffff"}" stroke-width="0.9">`);
+  for (const d of nodes) {
+    const dim = ego && !ego.has(d.id);
+    out.push(`<circle cx="${X(d).toFixed(1)}" cy="${Y(d).toFixed(1)}" r="${(radiusOf(d) * k).toFixed(2)}" fill="${colourOf(d)}" opacity="${dim ? .18 : 1}"><title>${esc(d.label)}</title></circle>`);
+  }
+  out.push(`</g>`);
+  const placed = placeLabels(nodes, k);      // same choices the screen made
+  if (placed.length) {
+    out.push(`<g id="labels" font-family="Helvetica, Arial, sans-serif" font-size="${V.labelSize}" text-anchor="middle">`);
+    for (const { node: d } of placed) {
+      const dim = ego && !ego.has(d.id);
+      const y = Y(d) + radiusOf(d) * k + V.labelSize;
+      out.push(`<text x="${X(d).toFixed(1)}" y="${y.toFixed(1)}" opacity="${dim ? .16 : 1}"` +
+        ` paint-order="stroke" stroke="${V.dark ? "#12161c" : "#ffffff"}" stroke-width="3" stroke-linejoin="round"` +
+        ` fill="${V.dark ? "#e8edf4" : "#1b1f26"}">${esc(d.label)}</text>`);
+    }
+    out.push(`</g>`);
+  }
+  out.push(`</svg>`);
+  download(`${baseName()}_${stamp()}.svg`, out.join("\n"), "image/svg+xml;charset=utf-8");
+}
+
+function nodeExportRows() {
+  const attrCols = attributeKeys();
+  const metCols = [...S.metricsDone];
+  const cols = ["id", "label", "degree", "weighted_degree",
+    ...metCols.filter(k => k !== "degree" && k !== "strength"), ...attrCols, "x", "y"];
+  const rows = S.G.nodes.map(n => {
+    const o = {
+      id: n.id, label: n.label, degree: n.deg, weighted_degree: n.str,
+      x: Math.round(n.x * 100) / 100, y: Math.round(n.y * 100) / 100
+    };
+    // communities are numbered from 1 in every export, matching what the UI shows
+    for (const k of metCols) if (k !== "degree" && k !== "strength")
+      o[k] = (k === "community" && n.m[k] != null) ? n.m[k] + 1 : n.m[k];
+    for (const k of attrCols) o[k] = n.attrs[k] ?? "";
+    return o;
+  });
+  return { cols, rows };
+}
+function exportNodesCSV() {
+  const { cols, rows } = nodeExportRows();
+  download(`${baseName()}_nodes_${stamp()}.csv`, toCSV(rows, cols), "text/csv;charset=utf-8");
+}
+function exportEdgesCSV() {
+  const infoCols = [...new Set(S.G.links.flatMap(l => Object.keys(l.info || {})))];
+  const cols = ["source", "target", "weight", "rows", ...(S.map.mode === "co" ? ["shared"] : []), ...infoCols];
+  const rows = S.G.links.map(L => {
+    const o = { source: L.source.label, target: L.target.label, weight: L.w, rows: L.n };
+    if (S.map.mode === "co") o.shared = (L.groups || []).join(" | ");
+    for (const c of infoCols) o[c] = (L.info[c] || []).join(" | ");
+    return o;
+  });
+  download(`${baseName()}_edges_${stamp()}.csv`, toCSV(rows, cols), "text/csv;charset=utf-8");
+}
+
+/* ------------------------------------------- subsets and communities ---- */
+function communityList() {
+  const by = new Map();
+  for (const n of S.G.nodes) {
+    const c = n.m.community;
+    if (c == null) continue;
+    (by.get(c) || by.set(c, []).get(c)).push(n);
+  }
+  return [...by.entries()].sort((a, b) => a[0] - b[0]).map(([id, ns]) => ({
+    id, size: ns.length, nodes: ns,
+    top: [...ns].sort((a, b) => b.deg - a.deg).slice(0, 1).map(n => n.label)[0] || ""
+  }));
+}
+
+function exportSubsetNodes(ids, tag) {
+  const { cols, rows } = nodeExportRows();
+  const keep = rows.filter(r => ids.has(r.id));
+  download(`${baseName()}_${tag}_nodes_${stamp()}.csv`, toCSV(keep, cols), "text/csv;charset=utf-8");
+}
+
+/** boundary=false → only edges with both ends inside; true → only edges that
+    leave the group, with a column naming the outside partner. */
+function exportSubsetEdges(ids, tag, boundary) {
+  const infoCols = [...new Set(S.G.links.flatMap(l => Object.keys(l.info || {})))];
+  const cols = ["source", "target", "weight", "rows",
+    ...(boundary ? ["inside_node", "outside_node"] : []),
+    ...(S.map.mode === "co" ? ["shared"] : []), ...infoCols];
+  const rows = [];
+  for (const L of S.G.links) {
+    const a = ids.has(L.s), b = ids.has(L.t);
+    if (boundary ? !(a !== b) : !(a && b)) continue;
+    const o = { source: L.source.label, target: L.target.label, weight: L.w, rows: L.n };
+    if (boundary) {
+      o.inside_node = a ? L.source.label : L.target.label;
+      o.outside_node = a ? L.target.label : L.source.label;
+    }
+    if (S.map.mode === "co") o.shared = (L.groups || []).join(" | ");
+    for (const c of infoCols) o[c] = (L.info[c] || []).join(" | ");
+    rows.push(o);
+  }
+  if (!rows.length) return toast(boundary ? "This group has no ties to the outside." : "No edges inside this group.");
+  download(`${baseName()}_${tag}_edges_${stamp()}.csv`, toCSV(rows, cols), "text/csv;charset=utf-8");
+}
+
+function exportNodesByCommunity() {
+  const { cols, rows } = nodeExportRows();
+  // community first, then everything else, sorted so each group is contiguous
+  const ordered = ["community", ...cols.filter(c => c !== "community")];
+  const out = [...rows].sort((a, b) => (a.community ?? 0) - (b.community ?? 0) || b.degree - a.degree);
+  download(`${baseName()}_by_community_${stamp()}.csv`, toCSV(out, ordered), "text/csv;charset=utf-8");
+}
+
+function exportEdgesByCommunity() {
+  const cols = ["source", "target", "weight", "source_community", "target_community", "tie_type"];
+  const rows = S.G.links.map(L => {
+    const a = (L.source.m.community ?? -1) + 1, b = (L.target.m.community ?? -1) + 1;
+    return {
+      source: L.source.label, target: L.target.label, weight: L.w,
+      source_community: a, target_community: b,
+      tie_type: a === b ? "within" : "between"
+    };
+  });
+  download(`${baseName()}_edges_by_community_${stamp()}.csv`, toCSV(rows, cols), "text/csv;charset=utf-8");
+}
+
+function exportCommunitySummary() {
+  const list = communityList();
+  const attrKey = (S.view.colorBy !== "__none__" && S.view.colorBy !== "__community__") ? S.view.colorBy : null;
+  const cols = ["community", "size", "internal_edges", "external_edges", "share_internal",
+    "density", "mean_degree", "total_weight", "top_members",
+    ...(attrKey ? [`dominant_${attrKey}`, `dominant_${attrKey}_share`] : [])];
+  const rows = list.map(c => {
+    const ids = new Set(c.nodes.map(n => n.id));
+    let inside = 0, outside = 0, wsum = 0;
+    for (const L of S.G.links) {
+      const a = ids.has(L.s), b = ids.has(L.t);
+      if (a && b) { inside++; wsum += L.w; }
+      else if (a || b) outside++;
+    }
+    const maxE = c.size > 1 ? c.size * (c.size - 1) / 2 : 0;
+    const rank = S.metricsDone.has("betweenness") ? "betweenness" : "degree";
+    const top = [...c.nodes].sort((a, b) => (b.m[rank] ?? 0) - (a.m[rank] ?? 0)).slice(0, 5).map(n => n.label);
+    const o = {
+      community: c.id + 1, size: c.size, internal_edges: inside, external_edges: outside,
+      share_internal: inside + outside ? +(inside / (inside + outside)).toFixed(4) : "",
+      density: maxE ? +(inside / maxE).toFixed(4) : "",
+      mean_degree: +(c.nodes.reduce((a, n) => a + n.deg, 0) / c.size).toFixed(3),
+      total_weight: wsum,
+      top_members: top.join(" | ")
+    };
+    if (attrKey) {
+      const cnt = new Map();
+      for (const n of c.nodes) {
+        const v = n.attrs[attrKey];
+        if (v == null || v === "") continue;
+        cnt.set(v, (cnt.get(v) || 0) + 1);
+      }
+      const best = [...cnt.entries()].sort((a, b) => b[1] - a[1])[0];
+      o[`dominant_${attrKey}`] = best ? best[0] : "";
+      o[`dominant_${attrKey}_share`] = best ? +(best[1] / c.size).toFixed(3) : "";
+    }
+    return o;
+  });
+  download(`${baseName()}_community_summary_${stamp()}.csv`, toCSV(rows, cols), "text/csv;charset=utf-8");
+}
+
+function exportGEXF() {
+  const attrCols = attributeKeys();
+  const metCols = [...S.metricsDone].filter(k => k !== "degree" && k !== "strength");
+  const defs = [...attrCols.map(c => ({ id: c, type: "string" })),
+  ...metCols.map(c => ({ id: c, type: "double" }))];
+  const id = new Map(S.G.nodes.map((n, i) => [n.id, i]));
+  const x = [`<?xml version="1.0" encoding="UTF-8"?>`,
+  `<gexf xmlns="http://www.gexf.net/1.2draft" xmlns:viz="http://www.gexf.net/1.2draft/viz" version="1.2">`,
+  `<meta lastmodifieddate="${stamp()}"><creator>Network Explorer</creator><description>${esc(S.raw.name)}</description></meta>`,
+  `<graph mode="static" defaultedgetype="${S.map.directed ? "directed" : "undirected"}">`,
+  `<attributes class="node">${defs.map((d, i) => `<attribute id="${i}" title="${esc(d.id)}" type="${d.type}"/>`).join("")}</attributes>`,
+  `<nodes>`];
+  for (const n of S.G.nodes) {
+    const vals = defs.map((d, i) => {
+      const v = attrCols.includes(d.id) ? n.attrs[d.id] : n.m[d.id];
+      return (v == null || v === "") ? "" : `<attvalue for="${i}" value="${esc(v)}"/>`;
+    }).join("");
+    const c = d3.color(colourOf(n)) || { r: 120, g: 130, b: 150 };
+    x.push(`<node id="${id.get(n.id)}" label="${esc(n.label)}">` +
+      `<viz:size value="${radiusOf(n).toFixed(2)}"/>` +
+      `<viz:position x="${n.x.toFixed(2)}" y="${(-n.y).toFixed(2)}" z="0"/>` +
+      `<viz:color r="${c.r}" g="${c.g}" b="${c.b}"/>` +
+      (vals ? `<attvalues>${vals}</attvalues>` : "") + `</node>`);
+  }
+  x.push(`</nodes><edges>`);
+  S.G.links.forEach((L, i) =>
+    x.push(`<edge id="${i}" source="${id.get(L.s)}" target="${id.get(L.t)}" weight="${L.w}"/>`));
+  x.push(`</edges></graph></gexf>`);
+  download(`${baseName()}_${stamp()}.gexf`, x.join("\n"), "application/xml;charset=utf-8");
+}
+
+function exportGraphML() {
+  const attrCols = attributeKeys();
+  const metCols = [...S.metricsDone].filter(k => k !== "degree" && k !== "strength");
+  const keys = [...attrCols.map(c => [c, "string"]), ...metCols.map(c => [c, "double"])];
+  const id = new Map(S.G.nodes.map((n, i) => [n.id, "n" + i]));
+  const x = [`<?xml version="1.0" encoding="UTF-8"?>`,
+  `<graphml xmlns="http://graphml.graphdrawing.org/xmlns">`,
+  `<key id="label" for="node" attr.name="label" attr.type="string"/>`,
+  `<key id="x" for="node" attr.name="x" attr.type="double"/>`,
+  `<key id="y" for="node" attr.name="y" attr.type="double"/>`,
+  ...keys.map(([c, t], i) => `<key id="k${i}" for="node" attr.name="${esc(c)}" attr.type="${t}"/>`),
+  `<key id="w" for="edge" attr.name="weight" attr.type="double"/>`,
+  `<graph edgedefault="${S.map.directed ? "directed" : "undirected"}">`];
+  for (const n of S.G.nodes) {
+    const vals = keys.map(([c], i) => {
+      const v = attrCols.includes(c) ? n.attrs[c] : n.m[c];
+      return (v == null || v === "") ? "" : `<data key="k${i}">${esc(v)}</data>`;
+    }).join("");
+    x.push(`<node id="${id.get(n.id)}"><data key="label">${esc(n.label)}</data>` +
+      `<data key="x">${n.x.toFixed(2)}</data><data key="y">${n.y.toFixed(2)}</data>${vals}</node>`);
+  }
+  S.G.links.forEach((L, i) =>
+    x.push(`<edge id="e${i}" source="${id.get(L.s)}" target="${id.get(L.t)}"><data key="w">${L.w}</data></edge>`));
+  x.push(`</graph></graphml>`);
+  download(`${baseName()}_${stamp()}.graphml`, x.join("\n"), "application/xml;charset=utf-8");
+}
+
+/* --------------------------------------------------------- session I/O -- */
+function saveSession() {
+  const payload = {
+    format: "network-explorer/session", version: 1, saved: new Date().toISOString(),
+    source: S.raw.name, map: S.map,
+    view: { ...S.view, hidden: [...S.view.hidden] },
+    transform: { x: S.tf.x, y: S.tf.y, k: S.tf.k },
+    metricsDone: [...S.metricsDone],
+    picked: [...S.picked],
+    modularity: S.modularity ?? null, communityCount: S.communityCount ?? null,
+    stats: S.stats,
+    rows: S.raw.rows, fields: S.raw.fields,
+    attrRows: S.attrRaw?.rows || null, attrFields: S.attrRaw?.fields || null, attrName: S.attrRaw?.name || null,
+    positions: Object.fromEntries(S.G.nodes.map(n =>
+      [n.id, [Math.round(n.x * 100) / 100, Math.round(n.y * 100) / 100, n.fx != null ? 1 : 0]])),
+    metrics: Object.fromEntries(S.G.nodes.map(n => [n.id, n.m]))
+  };
+  download(`${baseName()}_session_${stamp()}.json`, JSON.stringify(payload), "application/json;charset=utf-8");
+}
+
+function loadSession(file) {
+  const fr = new FileReader();
+  fr.onload = () => {
+    let d;
+    try { d = JSON.parse(fr.result); } catch { return alert("That is not a valid session file."); }
+    if (d.format !== "network-explorer/session") return alert("That JSON is not a Network Explorer session.");
+    S.raw = { rows: d.rows, fields: d.fields, name: d.source };
+    S.attrRaw = d.attrRows ? { rows: d.attrRows, fields: d.attrFields, name: d.attrName } : null;
+    S.map = d.map;
+    build();
+    for (const n of S.G.nodes) {
+      const p = d.positions?.[n.id];
+      if (p) { n.x = p[0]; n.y = p[1]; if (p[2]) { n.fx = p[0]; n.fy = p[1]; } }
+      const m = d.metrics?.[n.id];
+      if (m) Object.assign(n.m, m);
+    }
+    S.metricsDone = new Set(d.metricsDone || ["degree", "strength"]);
+    S.picked = new Set(d.picked || []);
+    S.modularity = d.modularity; S.communityCount = d.communityCount; S.stats = d.stats;
+    S.view = { ...S.view, ...d.view, hidden: new Set(d.view.hidden || []) };
+    if (S.sim) { S.sim.stop(); S.sim = null; }
+    refreshSizeExtent(); applyColours();
+    if (d.transform) { S.tf = d3.zoomIdentity.translate(d.transform.x, d.transform.y).scale(d.transform.k); }
+    d3.select(CANVAS).call(zoom.transform, S.tf);
+    renderAll(); draw();
+    toast("Session restored — layout, settings and metrics are exactly as saved.");
+  };
+  fr.readAsText(file);
+}
+
+function copyMethods() {
+  const st = S.stats || {};
+  const done = [...S.metricsDone].filter(k => k !== "degree" && k !== "strength");
+  const txt =
+    `The network was built from ${S.raw.name} (${S.raw.rows.length.toLocaleString()} rows). ` +
+    (S.map.mode === "co"
+      ? `Each row records the presence of a "${S.map.a}" in a "${S.map.b}"; two nodes were linked when they appear in the same "${S.map.b}", and the edge weight is the number of such shared units. `
+      : `Each row was read as an ${S.map.directed ? "directed" : "undirected"} edge between "${S.map.a}" and "${S.map.b}"${S.map.weightCol !== "__count__" ? `, weighted by "${S.map.weightCol}"` : ""}. `) +
+    `The resulting graph has ${S.G.nodes.length.toLocaleString()} nodes and ${S.G.links.length.toLocaleString()} edges` +
+    (st.density != null ? ` (density ${fmt(st.density, 4)}, ${st.components} connected component${st.components === 1 ? "" : "s"}, largest containing ${st.largest} nodes` +
+      (st.avgPath ? `, mean shortest path ${fmt(st.avgPath, 2)}, diameter ${st.diameter}` : "") + `)` : "") + `. ` +
+    (done.length ? `Node-level measures computed: ${done.map(k => (METRIC_LABEL[k] || k).toLowerCase()).join(", ")}` +
+      (S.useWeights ? ", using edge weights as inverse distances" : ", unweighted") + `. ` : "") +
+    (S.metricsDone.has("community") ? `Communities were detected with the Louvain method (${S.communityCount} communities, modularity Q = ${fmt(S.modularity, 3)}). ` : "") +
+    (S.view.threshold > 0 ? `Edges with a weight below ${fmt(S.view.threshold)} are hidden in the figure. ` : "") +
+    `Layout: ${S.view.layout === "circle" ? "circular, ordered by centrality" : S.view.layout === "grid" ? "clustered by category" : "force-directed"}. ` +
+    `Analysis and figure produced with Network Explorer.`;
+  navigator.clipboard?.writeText(txt).then(
+    () => toast("Methods paragraph copied to the clipboard."),
+    () => openModal("Methods note", `<textarea style="width:100%;height:200px;padding:10px;border:1px solid var(--line);border-radius:8px">${esc(txt)}</textarea>`, null, "", ""));
+}
+
+/* ============================================================== INIT ===== */
+function renderAll() {
+  refreshSizeExtent();
+  renderDataPanel();
+  renderStylePanel();
+  renderAnalysisPanel();
+  renderExportPanel();
+  renderLegend();
+  renderSelectionBar();
+  renderStatus();
+}
+
+window.addEventListener("keydown", e => {
+  if (e.key === "Escape") { closeModal(); if (S.selected) { S.selected = null; renderAnalysisSelection(); draw(); } }
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+  if (e.key === "f") fit();
+  if (e.key === "/") { e.preventDefault(); searchBox.focus(); }
+});
+
+sizeCanvas();
+renderAll();
+/* END */

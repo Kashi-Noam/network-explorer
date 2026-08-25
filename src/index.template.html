@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network Explorer — Social Network Analysis from a CSV</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<style>
+:root{
+  --bg:#f6f7f9; --panel:#ffffff; --ink:#1b1f26; --muted:#6b7280; --line:#e3e6ea;
+  --accent:#2f5fd0; --accent-soft:#eaf0fd; --warn:#b45309; --ok:#0f766e;
+  --shadow:0 1px 2px rgba(16,24,40,.06),0 4px 16px rgba(16,24,40,.06);
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:var(--ink); background:var(--bg); overflow:hidden;
+}
+button,input,select,textarea{font:inherit;color:inherit}
+h1,h2,h3,h4{margin:0;font-weight:650;letter-spacing:-.01em}
+
+/* ---------- shell ---------- */
+#app{display:flex;height:100%}
+#side{
+  width:352px;min-width:352px;height:100%;background:var(--panel);
+  border-right:1px solid var(--line);display:flex;flex-direction:column;
+}
+#brand{padding:14px 16px 12px;border-bottom:1px solid var(--line)}
+#brand h1{font-size:15px}
+#brand p{margin:3px 0 0;font-size:11.5px;color:var(--muted)}
+#tabs{display:flex;border-bottom:1px solid var(--line);background:#fafbfc}
+#tabs button{
+  flex:1;padding:9px 4px;background:none;border:0;border-bottom:2px solid transparent;
+  color:var(--muted);cursor:pointer;font-size:12.5px;font-weight:550;
+}
+#tabs button:hover{color:var(--ink)}
+#tabs button.on{color:var(--accent);border-bottom-color:var(--accent);background:#fff}
+#panels{flex:1;overflow-y:auto;overscroll-behavior:contain}
+.panel{display:none;padding:14px 16px 32px}
+.panel.on{display:block}
+
+/* ---------- generic controls ---------- */
+.sect{margin-bottom:18px}
+.sect > h3{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px}
+.row{margin-bottom:10px}
+.row > label{display:block;font-size:12px;font-weight:550;margin-bottom:4px}
+.hint{font-size:11.5px;color:var(--muted);margin-top:3px;line-height:1.45}
+select,input[type=text],input[type=number]{
+  width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:#fff;
+}
+select:focus,input:focus{outline:2px solid var(--accent-soft);border-color:var(--accent)}
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  padding:7px 12px;border:1px solid var(--line);border-radius:7px;background:#fff;
+  cursor:pointer;font-size:13px;font-weight:550;
+}
+.btn:hover{background:#f3f5f8}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{background:#254db0}
+.btn.wide{width:100%}
+.btn.sm{padding:5px 9px;font-size:12px}
+.btnrow{display:flex;gap:6px;flex-wrap:wrap}
+.chk{display:flex;align-items:flex-start;gap:7px;margin:5px 0;font-size:12.5px;cursor:pointer}
+.chk input{margin:2px 0 0}
+.scrollbox{max-height:190px;overflow-y:auto;border:1px solid var(--line);border-radius:7px;padding:7px 9px;background:#fcfcfd}
+.pill{display:inline-block;padding:1px 7px;border-radius:99px;background:var(--accent-soft);color:var(--accent);font-size:11px;font-weight:600}
+.slider{display:flex;align-items:center;gap:8px}
+.slider input[type=range]{flex:1}
+.slider output{min-width:44px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px;color:var(--muted)}
+.note{border-left:3px solid var(--accent);background:var(--accent-soft);padding:8px 10px;border-radius:0 6px 6px 0;font-size:12px;line-height:1.5}
+.note.warn{border-left-color:var(--warn);background:#fef6ec;color:#7c4a06}
+
+/* ---------- drop zone ---------- */
+#drop{
+  border:2px dashed #c9d0da;border-radius:10px;padding:22px 14px;text-align:center;
+  background:#fbfcfd;cursor:pointer;transition:.15s;
+}
+#drop:hover,#drop.hot{border-color:var(--accent);background:var(--accent-soft)}
+#drop strong{display:block;font-size:13.5px;margin-bottom:3px}
+#drop span{font-size:11.5px;color:var(--muted)}
+
+/* ---------- stage ---------- */
+#stage{flex:1;position:relative;background:#fff;overflow:hidden}
+#cv{display:block;width:100%;height:100%}
+#empty{
+  position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:10px;color:var(--muted);text-align:center;padding:30px;
+}
+#empty svg{opacity:.25}
+.overlay{position:absolute;z-index:5}
+#searchwrap{top:12px;left:12px;width:250px}
+#search{
+  width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;
+  background:rgba(255,255,255,.95);box-shadow:var(--shadow);
+}
+#hits{
+  margin-top:4px;background:#fff;border:1px solid var(--line);border-radius:8px;
+  box-shadow:var(--shadow);max-height:220px;overflow-y:auto;display:none;
+}
+#hits div{padding:6px 10px;cursor:pointer;font-size:12.5px;border-bottom:1px solid #f1f3f5}
+#hits div:last-child{border-bottom:0}
+#hits div:hover{background:var(--accent-soft)}
+#zoomer{top:12px;right:12px;display:flex;flex-direction:column;gap:5px}
+#zoomer button{
+  width:32px;height:32px;border:1px solid var(--line);border-radius:8px;background:rgba(255,255,255,.95);
+  cursor:pointer;font-size:15px;line-height:1;box-shadow:var(--shadow);
+}
+#zoomer button:hover{background:#f3f5f8}
+#statusbar{
+  bottom:0;left:0;right:0;padding:6px 12px;background:rgba(255,255,255,.94);
+  border-top:1px solid var(--line);font-size:11.5px;color:var(--muted);
+  display:flex;gap:16px;flex-wrap:wrap;
+}
+#statusbar b{color:var(--ink);font-weight:600;font-variant-numeric:tabular-nums}
+#zoomer button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+#selbar{
+  bottom:34px;left:50%;transform:translateX(-50%);display:none;align-items:center;gap:9px;
+  background:rgba(255,255,255,.97);border:1px solid var(--line);border-radius:10px;
+  padding:7px 10px;box-shadow:var(--shadow);font-size:12.5px;white-space:nowrap;
+}
+#selbar b{font-variant-numeric:tabular-nums;color:var(--accent)}
+#selbar .sep{width:1px;height:18px;background:var(--line)}
+#selbar button{
+  border:1px solid var(--line);background:#fff;border-radius:6px;padding:4px 8px;
+  cursor:pointer;font-size:12px;font-weight:550;
+}
+#selbar button:hover{background:#f3f5f8}
+#selbar button.acc{background:var(--accent);border-color:var(--accent);color:#fff}
+#selbar button.acc:hover{background:#254db0}
+#legend{
+  bottom:34px;left:12px;background:rgba(255,255,255,.95);border:1px solid var(--line);
+  border-radius:8px;padding:8px 10px;box-shadow:var(--shadow);max-width:230px;
+  max-height:40%;overflow-y:auto;display:none;
+}
+#legend h4{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:6px}
+#legend .item{display:flex;align-items:center;gap:7px;font-size:12px;margin:3px 0;cursor:pointer}
+#legend .swatch{width:11px;height:11px;border-radius:50%;flex:none;border:1px solid rgba(0,0,0,.15)}
+#legend .item.off{opacity:.35}
+#tip{
+  position:absolute;z-index:20;pointer-events:none;display:none;max-width:320px;
+  background:rgba(24,28,35,.95);color:#fff;border-radius:8px;padding:8px 10px;
+  font-size:12px;line-height:1.5;box-shadow:0 6px 24px rgba(0,0,0,.25);
+}
+#tip .t{font-weight:650;margin-bottom:4px;font-size:12.5px}
+#tip .k{color:#a8b3c4}
+#busy{
+  position:absolute;inset:0;z-index:40;display:none;align-items:center;justify-content:center;
+  background:rgba(255,255,255,.75);font-size:13px;font-weight:550;
+}
+
+/* ---------- modal ---------- */
+#modal{
+  position:fixed;inset:0;z-index:100;display:none;align-items:center;justify-content:center;
+  background:rgba(20,24,31,.42);padding:24px;
+}
+#modal.on{display:flex}
+#sheet{
+  background:#fff;border-radius:12px;width:min(880px,100%);max-height:92vh;display:flex;
+  flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.28);
+}
+#sheet header{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+#sheet header h2{font-size:16px}
+#sheet .body{padding:18px 20px;overflow-y:auto}
+#sheet footer{padding:13px 20px;border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:10px}
+.x{background:none;border:0;font-size:20px;cursor:pointer;color:var(--muted);line-height:1;padding:2px 6px}
+.x:hover{color:var(--ink)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+@media(max-width:720px){.grid2,.grid3{grid-template-columns:1fr}}
+.modecard{
+  border:1.5px solid var(--line);border-radius:9px;padding:11px 13px;cursor:pointer;background:#fff;
+}
+.modecard:hover{border-color:#b9c4d6}
+.modecard.on{border-color:var(--accent);background:var(--accent-soft)}
+.modecard b{display:block;font-size:13px;margin-bottom:3px}
+.modecard span{font-size:11.5px;color:var(--muted);line-height:1.45;display:block}
+
+/* ---------- tables ---------- */
+.tblwrap{overflow:auto;border:1px solid var(--line);border-radius:8px;max-height:260px}
+table{border-collapse:collapse;width:100%;font-size:12px}
+th,td{padding:5px 9px;border-bottom:1px solid #eef0f3;text-align:left;white-space:nowrap}
+th{
+  background:#f7f8fa;position:sticky;top:0;font-weight:600;font-size:11.5px;
+  color:var(--muted);text-transform:uppercase;letter-spacing:.04em;z-index:1;
+}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:var(--ink)}
+td.num{text-align:right;font-variant-numeric:tabular-nums}
+tbody tr:hover{background:var(--accent-soft)}
+tbody tr{cursor:pointer}
+
+/* ---------- metric cards ---------- */
+.metric{border:1px solid var(--line);border-radius:9px;margin-bottom:8px;overflow:hidden}
+.metric > button{
+  width:100%;display:flex;justify-content:space-between;align-items:center;gap:8px;
+  padding:9px 11px;background:#fff;border:0;cursor:pointer;text-align:left;
+}
+.metric > button:hover{background:#f7f8fa}
+.metric > button b{font-size:12.5px;font-weight:600}
+.metric .why{padding:0 11px 11px;font-size:12px;color:#414855;line-height:1.55;display:none;border-top:1px solid #f0f2f5;padding-top:9px}
+.metric.open .why{display:block}
+.metric .why em{color:var(--accent);font-style:normal;font-weight:600}
+.metric .why .formula{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;background:#f6f7f9;padding:5px 7px;border-radius:5px;display:block;margin:6px 0}
+.stat{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px dashed #eceff3;font-size:12.5px}
+.stat:last-child{border-bottom:0}
+.stat b{font-variant-numeric:tabular-nums}
+.caret{color:var(--muted);font-size:11px;transition:transform .15s}
+.metric.open .caret{transform:rotate(90deg)}
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <div id="brand">
+      <h1>Network Explorer</h1>
+      <p>Social network analysis from a CSV — everything runs in your browser.</p>
+    </div>
+    <nav id="tabs">
+      <button data-tab="data" class="on">Data</button>
+      <button data-tab="style">Style</button>
+      <button data-tab="analysis">Analysis</button>
+      <button data-tab="export">Export</button>
+    </nav>
+    <div id="panels">
+      <section class="panel on" data-panel="data"></section>
+      <section class="panel" data-panel="style"></section>
+      <section class="panel" data-panel="analysis"></section>
+      <section class="panel" data-panel="export"></section>
+    </div>
+  </aside>
+
+  <main id="stage">
+    <canvas id="cv"></canvas>
+    <div id="empty">
+      <svg width="72" height="72" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3">
+        <circle cx="5" cy="6" r="2.2"/><circle cx="19" cy="7" r="2.2"/><circle cx="12" cy="13" r="2.6"/>
+        <circle cx="6" cy="19" r="2.2"/><circle cx="18" cy="18" r="2.2"/>
+        <path d="M7 6.6 9.8 12M16.9 8 14 11.6M10.4 15 7.6 17.2M14 14.8l2.6 2"/>
+      </svg>
+      <div><strong>No network loaded</strong><br><span style="font-size:12.5px">Upload a CSV in the Data tab, or load the example dataset.</span></div>
+    </div>
+    <div class="overlay" id="searchwrap">
+      <input id="search" type="text" placeholder="Search for a node…" autocomplete="off" spellcheck="false">
+      <div id="hits"></div>
+    </div>
+    <div class="overlay" id="zoomer">
+      <button id="zin" title="Zoom in">+</button>
+      <button id="zout" title="Zoom out">−</button>
+      <button id="zfit" title="Fit to screen" style="font-size:12px">⤢</button>
+      <button id="zsel" title="Marquee select — drag a box around nodes (or hold Shift and drag)" style="font-size:13px">▨</button>
+    </div>
+    <div class="overlay" id="selbar"></div>
+    <div class="overlay" id="legend"></div>
+    <div class="overlay" id="statusbar"></div>
+    <div id="tip"></div>
+    <div id="busy">Working…</div>
+  </main>
+</div>
+
+<div id="modal"><div id="sheet">
+  <header><h2 id="sheet-title">Map your columns</h2><button class="x" id="sheet-x">×</button></header>
+  <div class="body" id="sheet-body"></div>
+  <footer>
+    <span id="sheet-note" class="hint"></span>
+    <span style="display:flex;gap:8px">
+      <button class="btn" id="sheet-cancel">Cancel</button>
+      <button class="btn primary" id="sheet-ok">Build network</button>
+    </span>
+  </footer>
+</div></div>
+
+<script id="demo-appearances" type="text/csv">__DEMO_APPEARANCES__</script>
+<script id="demo-persons" type="text/csv">__DEMO_PERSONS__</script>
+
+<script>
+/* ==========================================================================
+   Network Explorer — a single-file, client-side SNA tool.
+   No data ever leaves the browser: the CSV is parsed in memory and nothing
+   is uploaded anywhere.
+   ========================================================================== */
+"use strict";
+/* __APP__ */
+</script>
+</body>
+</html>
