@@ -80,6 +80,19 @@ available to it.
 
 ---
 
+## Finding your way around
+
+A guided tour runs the first time the page is opened — nine steps through loading a
+file, reading the picture, styling it, measuring it and exporting. It can be
+replayed at any time from the **Guide** button in the top corner, and dismissed
+with Esc.
+
+Small **?** marks sit beside the controls that deserve a sentence: what
+co-occurrence mode actually does, why the weight threshold matters more than it
+looks, what "use edge weights" changes about betweenness. Hover one and the
+explanation appears. Every metric also carries a longer note — what it counts,
+how to read it, and what it hides — inside its card in the Analysis tab.
+
 ## Running it
 
 Open `index.html` in a browser. That is the whole thing — one self-contained

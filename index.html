@@ -151,6 +151,48 @@ select:focus,input:focus{outline:2px solid var(--accent-soft);border-color:var(-
   background:rgba(255,255,255,.75);font-size:13px;font-weight:550;
 }
 
+/* ---------- inline help ---------- */
+.help{
+  display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;
+  border-radius:50%;border:1px solid #c3ccd8;background:#fff;color:#7a8698;
+  font-size:10.5px;font-weight:700;cursor:help;margin-inline-start:5px;vertical-align:middle;
+  line-height:1;user-select:none;flex:none;
+}
+.help:hover,.help:focus{background:var(--accent);border-color:var(--accent);color:#fff;outline:none}
+#helppop{
+  position:fixed;z-index:200;max-width:330px;display:none;
+  background:#fff;border:1px solid var(--line);border-radius:10px;padding:11px 13px;
+  box-shadow:0 8px 30px rgba(16,24,40,.16);font-size:13px;line-height:1.6;color:#333b47;
+}
+#helppop b{color:var(--ink)}
+#helppop code{background:#f2f4f7;border-radius:4px;padding:1px 4px;font-size:12px}
+
+/* ---------- guided tour ---------- */
+#tour{position:fixed;inset:0;z-index:300;display:none}
+#tour.on{display:block}
+/* the dimming is done entirely by the spotlight's huge box-shadow, so the
+   highlighted element stays bright; the veil only catches stray clicks */
+#tour-veil{position:absolute;inset:0;background:transparent}
+#tour-hole{
+  position:absolute;border-radius:10px;box-shadow:0 0 0 9999px rgba(14,18,25,.55);
+  border:2px solid var(--accent);transition:all .28s cubic-bezier(.4,0,.2,1);pointer-events:none;
+}
+#tour-card{
+  position:absolute;width:340px;background:#fff;border-radius:12px;padding:17px 19px 15px;
+  box-shadow:0 16px 50px rgba(0,0,0,.3);transition:all .28s cubic-bezier(.4,0,.2,1);
+}
+#tour-card h4{font-size:15px;margin-bottom:6px}
+#tour-card p{margin:0;font-size:13.5px;line-height:1.65;color:#3d4550}
+#tour-card .tip{margin-top:9px;font-size:12.5px;color:var(--accent);background:var(--accent-soft);
+  padding:7px 10px;border-radius:7px;line-height:1.55}
+#tour-foot{display:flex;align-items:center;justify-content:space-between;margin-top:14px;gap:10px}
+#tour-dots{display:flex;gap:5px}
+#tour-dots i{width:6px;height:6px;border-radius:50%;background:#d4dae3;display:block}
+#tour-dots i.on{background:var(--accent);width:16px;border-radius:3px}
+#tour-foot .btn{padding:6px 12px}
+#tour-skip{background:none;border:0;color:var(--muted);cursor:pointer;font-size:12.5px;text-decoration:underline}
+#tour-skip:hover{color:var(--ink)}
+
 /* ---------- modal ---------- */
 #modal{
   position:fixed;inset:0;z-index:100;display:none;align-items:center;justify-content:center;
@@ -215,8 +257,14 @@ tbody tr{cursor:pointer}
 <div id="app">
   <aside id="side">
     <div id="brand">
-      <h1>Network Explorer</h1>
-      <p>Social network analysis from a CSV — everything runs in your browser.</p>
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px">
+        <div>
+          <h1>Network Explorer</h1>
+          <p>Social network analysis from a CSV — everything runs in your browser.</p>
+        </div>
+        <button class="btn sm" id="guide" title="Take the tour of the interface"
+          style="flex:none;padding:5px 10px">Guide</button>
+      </div>
     </div>
     <nav id="tabs">
       <button data-tab="data" class="on">Data</button>
@@ -258,6 +306,25 @@ tbody tr{cursor:pointer}
     <div id="tip"></div>
     <div id="busy">Working…</div>
   </main>
+</div>
+
+<div id="helppop"></div>
+<div id="tour">
+  <div id="tour-veil"></div>
+  <div id="tour-hole"></div>
+  <div id="tour-card">
+    <h4 id="tour-title"></h4>
+    <p id="tour-text"></p>
+    <div class="tip" id="tour-tip" style="display:none"></div>
+    <div id="tour-foot">
+      <button id="tour-skip">Skip</button>
+      <div id="tour-dots"></div>
+      <span style="display:flex;gap:6px">
+        <button class="btn sm" id="tour-back">Back</button>
+        <button class="btn sm primary" id="tour-next">Next</button>
+      </span>
+    </div>
+  </div>
 </div>
 
 <div id="modal"><div id="sheet">
@@ -1084,7 +1151,16 @@ const busy = (on, msg = "Working…") => {
   const b = document.getElementById("busy");
   b.textContent = msg; b.style.display = on ? "flex" : "none";
 };
-const nextFrame = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+/* Yield to the browser so the "Working…" overlay can paint before a long
+   computation starts. requestAnimationFrame is throttled to a standstill in a
+   background tab, so a plain rAF await would never resolve and the overlay
+   would hang forever if the user switched tabs — hence the timeout race. */
+const nextFrame = () => new Promise(r => {
+  let settled = false;
+  const done = () => { if (!settled) { settled = true; r(); } };
+  requestAnimationFrame(() => requestAnimationFrame(done));
+  setTimeout(done, 50);
+});
 
 const PALETTE = ["#2f5fd0", "#e4572e", "#17a398", "#8f4bd8", "#e8a33d", "#2a9d3f", "#d1467f",
   "#5b7fa6", "#a6761d", "#6a8f2f", "#c33c54", "#3d8bbf", "#8c6c9e", "#b07d4c",
@@ -1118,6 +1194,93 @@ function toCSV(rows, cols) {
   };
   return [cols.join(","), ...rows.map(r => cols.map(c => q(r[c])).join(","))].join("\n");
 }
+
+/* ============================================== INLINE HELP (the ? chips) == */
+/* Short, plain answers to "what is this and why would I touch it". Attached to
+   a control with helpChip("key"); one delegated listener serves them all. */
+const HELP = {
+  mode: `<b>How each row is read.</b> If a row already names two people who are connected, that is an
+    <b>edge list</b>. If a row says "this person took part in this thing", that is a
+    <b>co-occurrence list</b> — everyone sharing a document, meeting or event gets linked, and the edge
+    weight counts how many they share. Most spreadsheets in the humanities are the second kind.`,
+  weight: `<b>How strong a tie is.</b> The default counts how often the two appear together. Choosing a
+    number column instead sums that column. Weight drives edge thickness, the threshold slider, and
+    (optionally) the distance used by betweenness and closeness.`,
+  agg: `<b>When the same pair appears twice.</b> Two rows linking the same two people are merged into one
+    edge. This decides whether the weights add up, or the largest wins, or they are averaged.`,
+  directed: `<b>Does direction matter?</b> Tick this only if A→B means something different from B→A —
+    a letter sent, a payment made, a citation. Kinship, co-signing and co-appearance are not directed.`,
+  nodeinfo: `<b>What you see when hovering a node.</b> Pick the columns worth reading at a glance. When a
+    person has several different values in a column, the most frequent one is shown.`,
+  edgeinfo: `<b>What you see when hovering a link.</b> In co-occurrence mode this is where the shared
+    documents or events are listed — usually the most useful thing on the screen.`,
+  attrs: `<b>A second table, one row per node.</b> The edge table rarely carries a person's sect, gender,
+    origin or dates. Adding them here unlocks colouring, filtering and the homophily test. Rows are matched
+    by name, ignoring case and spacing.`,
+  layout: `<b>Where the nodes sit.</b> Force-directed pulls connected nodes together and pushes the rest
+    apart, so clusters appear by themselves. Positions have no units — only relative closeness means
+    anything, and every re-run gives a slightly different picture of the same structure.`,
+  components: `<b>Pieces that never touch.</b> Most real networks are not one connected lump. Narrowing the
+    view to a single component lets the layout spread it out properly instead of squashing it beside
+    everything else.`,
+  threshold: `<b>The most useful control here.</b> Hides ties below a weight. On a co-occurrence network,
+    where every document is already a complete clique, raising this until the picture becomes readable is
+    usually the difference between a hairball and a finding.`,
+  colour: `<b>Colour carries a category.</b> Any attribute with a manageable number of values can be used.
+    Clicking a row in the legend hides that value, which is a fast way to ask "what does this network look
+    like without them?"`,
+  size: `<b>Size carries a number.</b> Metrics appear in this list once you compute them in the Analysis
+    tab. Size is the quickest way to see whether the busy nodes and the structurally important nodes are
+    the same people — they often are not.`,
+  labels: `<b>Names on the canvas.</b> Showing all of them is unreadable above about fifty nodes, so the
+    default labels only the most central. Labels that would overlap one already drawn are dropped.`,
+  weighted: `<b>Should weight count as distance?</b> With this on, a heavier tie is treated as a
+    <i>shorter</i> distance (1 ÷ weight) when betweenness and closeness look for shortest paths — the
+    normal reading for co-occurrence data, where a stronger tie means the two are closer.`,
+  overview: `<b>The shape of the whole network.</b> Density is the share of possible links that exist.
+    Path length and diameter are counted in hops inside the largest component. Degree assortativity is
+    positive when hubs attach to hubs, negative when hubs attach to the periphery.`,
+  ranking: `<b>Everyone, sorted.</b> Click a row to fly to that node; shift-click to mark it for export.
+    Reading two different metrics down this list side by side is where most findings start.`,
+  marked: `<b>A group you carved out by hand.</b> Shift-drag a box on the canvas, or shift-click nodes one
+    at a time. Once marked you can grow the group to its neighbours, isolate it, and download its nodes and
+    its internal edges — that edge file can be re-uploaded here to analyse the subgroup on its own.`,
+  picture: `<b>Exports exactly what is on screen</b> — same zoom, same filters, same labels. Arrange the
+    view first. SVG stays sharp at any size and can be edited in Illustrator or Inkscape, which is what you
+    want for a figure in a paper; PNG is a flat image for slides.`,
+  session: `<b>Reproducibility.</b> Stores the column mapping, every setting and the exact node positions.
+    Re-opening it rebuilds this precise figure — worth saving next to any picture you publish.`
+};
+function helpChip(k) {
+  return `<span class="help" data-help="${k}" tabindex="0" role="button" aria-label="What is this?">?</span>`;
+}
+(function wireHelp() {
+  const pop = $("#helppop");
+  let hideTimer = null;
+  const show = (el) => {
+    const txt = HELP[el.dataset.help];
+    if (!txt) return;
+    clearTimeout(hideTimer);
+    pop.innerHTML = txt;
+    pop.style.display = "block";
+    const r = el.getBoundingClientRect(), p = pop.getBoundingClientRect();
+    let left = r.right + 10, top = r.top - 6;
+    if (left + p.width > innerWidth - 10) left = Math.max(10, r.left - p.width - 10);
+    if (top + p.height > innerHeight - 10) top = Math.max(10, innerHeight - p.height - 10);
+    pop.style.left = left + "px";
+    pop.style.top = top + "px";
+  };
+  const hide = () => { hideTimer = setTimeout(() => pop.style.display = "none", 120); };
+  document.addEventListener("mouseover", e => {
+    const el = e.target.closest?.(".help");
+    if (el) show(el);
+  });
+  document.addEventListener("mouseout", e => { if (e.target.closest?.(".help")) hide(); });
+  document.addEventListener("focusin", e => { if (e.target.closest?.(".help")) show(e.target); });
+  document.addEventListener("focusout", e => { if (e.target.closest?.(".help")) hide(); });
+  pop.addEventListener("mouseenter", () => clearTimeout(hideTimer));
+  pop.addEventListener("mouseleave", hide);
+})();
 
 /* ------------------------------------------------------------------ tabs -- */
 $$("#tabs button").forEach(b => b.onclick = () => {
@@ -1179,7 +1342,7 @@ function renderDataPanel() {
   </div>
 
   <div class="sect">
-    <h3>3 · Node attributes <span class="pill">optional</span></h3>
+    <h3>3 \u00b7 Node attributes <span class="pill">optional</span>${helpChip("attrs")}</h3>
     ${S.attrRaw ? `<div class="stat"><span>Attribute file</span><b>${esc(S.attrRaw.name)}</b></div>
        <div class="stat"><span>Rows matched</span><b>${S.attrMatched || 0}</b></div>` : ""}
     <button class="btn sm wide" id="attrbtn" ${loaded ? "" : "disabled"}>
@@ -1326,7 +1489,7 @@ function openMapper() {
     <p class="hint" style="margin:-10px 0 14px">${S.raw.rows.length.toLocaleString()} rows · ${F.length} columns · showing the first 4 rows</p>
 
     <div class="sect">
-      <h3>How should each row be read?</h3>
+      <h3>How should each row be read?${helpChip("mode")}</h3>
       <div class="grid2">
         <div class="modecard ${mode === "co" ? "on" : ""}" data-mode="co">
           <b>Co-occurrence (two-mode)</b>
@@ -1355,7 +1518,7 @@ function openMapper() {
 
       <div class="grid2">
         <div class="row">
-          <label>Edge weight</label>
+          <label>Edge weight${helpChip("weight")}</label>
           <select id="m-w">
             <option value="__count__">Count of shared rows (each row counts 1)</option>
             ${numericish.map(f => `<option value="${esc(f)}" ${prev.weightCol === f ? "selected" : ""}>Sum values of “${esc(f)}”</option>`).join("")}
@@ -1363,7 +1526,7 @@ function openMapper() {
           <p class="hint">How strongly two nodes are tied. The default counts how often they appear together.</p>
         </div>
         <div class="row">
-          <label>If the same pair repeats</label>
+          <label>If the same pair repeats${helpChip("agg")}</label>
           <select id="m-agg">
             <option value="sum">Add the weights together</option>
             <option value="max">Keep the largest</option>
@@ -1376,7 +1539,7 @@ function openMapper() {
 
       <div class="row" id="dir-row" style="${mode === "co" ? "display:none" : ""}">
         <label class="chk"><input type="checkbox" id="m-dir" ${prev.directed ? "checked" : ""}>
-          <span>Directed — A → B means something different from B → A (arrows are drawn, and metrics respect direction)</span></label>
+          <span>Directed — A \u2192 B means something different from B \u2192 A (arrows are drawn, and metrics respect direction)</span></label>${helpChip("directed")}
       </div>
     </div>
 
@@ -1384,7 +1547,7 @@ function openMapper() {
       <h3>What to show on hover</h3>
       <div class="grid2">
         <div class="row">
-          <label>Node details</label>
+          <label>Node details${helpChip("nodeinfo")}</label>
           <div class="scrollbox" id="m-nodeinfo">
             ${F.map(f => `<label class="chk"><input type="checkbox" value="${esc(f)}"
               ${(prev.nodeInfo || []).includes(f) ? "checked" : ""}><span>${esc(f)}</span></label>`).join("")}
@@ -1392,7 +1555,7 @@ function openMapper() {
           <p class="hint">Shown when the cursor is over a node. For repeated values the most frequent one is used.</p>
         </div>
         <div class="row">
-          <label>Edge details</label>
+          <label>Edge details${helpChip("edgeinfo")}</label>
           <div class="scrollbox" id="m-edgeinfo">
             ${F.map(f => `<label class="chk"><input type="checkbox" value="${esc(f)}"
               ${(prev.edgeInfo || []).includes(f) ? "checked" : ""}><span>${esc(f)}</span></label>`).join("")}
@@ -1484,7 +1647,15 @@ function build() {
       (node._info[c] ||= new Map()).set(v, (node._info[c]?.get(v) || 0) + 1);
     }
   };
-  const wOf = row => m.weightCol === "__count__" ? 1 : (parseFloat(row[m.weightCol]) || 0);
+  // A weight column that turns out not to be numeric would silently make every
+  // edge weigh zero — count the failures so we can say so instead.
+  let badWeights = 0;
+  const wOf = row => {
+    if (m.weightCol === "__count__") return 1;
+    const v = parseFloat(row[m.weightCol]);
+    if (!Number.isFinite(v)) { badWeights++; return 0; }
+    return v;
+  };
 
   const addLink = (na, nb, w, row, group) => {
     let s = na.id, t = nb.id;
@@ -1576,12 +1747,33 @@ function build() {
 
   S.metricsDone.clear(); S.stats = null; S.selected = null;
   S.picked.clear(); S.view.onlyPicked = false;
+  // the previous network's metrics and component numbers are gone; anything
+  // pointing at them would silently render grey or filter to nothing
+  if (S.view.colorBy === "__community__") S.view.colorBy = "__none__";
+  if (!["__uniform__", "degree", "strength"].includes(S.view.sizeBy)) S.view.sizeBy = "degree";
+  if (S.view.colorBy !== "__none__" && !attributeKeys().includes(S.view.colorBy)) S.view.colorBy = "__none__";
+  S.view.compFilter = null;
+  S.rankBy = null;
   S.view.threshold = 0;
   S.view.hidden.clear();
   computeBasics();
   $("#empty").style.display = nodeList.length ? "none" : "flex";
   busy(false);
-  if (S.pairCount > 250000) toast("This is a dense co-occurrence network — use the weight threshold in Style to thin it out.");
+
+  // say something useful instead of leaving the user with a blank canvas
+  if (!nodeList.length) {
+    toast(`No nodes came out of “${S.raw.name}”. Check that “${m.a}” and “${m.b}” are the right columns — ` +
+      `rows where either is blank, or where both hold the same name, are skipped.`);
+  } else if (!links.length) {
+    toast(m.mode === "co"
+      ? `${nodeList.length} nodes but no links: nothing in “${m.b}” is shared by two different “${m.a}” values.`
+      : `${nodeList.length} nodes but no links — every row paired a name with itself.`);
+  } else if (badWeights) {
+    toast(`${badWeights.toLocaleString()} of ${rows.length.toLocaleString()} rows have no number in ` +
+      `“${m.weightCol}”, so those edges weigh 0. Switch the weight back to “count of shared rows” if that is wrong.`);
+  } else if (S.pairCount > 250000) {
+    toast("This is a dense co-occurrence network — use the weight threshold in Style to thin it out.");
+  }
 }
 
 function indexGraph() {
@@ -1617,6 +1809,7 @@ function indexGraph() {
     cid++;
   }
   S.G.componentCount = cid;
+  S._bigComp = null;
 }
 
 function attachAttributes() {
@@ -1805,10 +1998,28 @@ function visibleNodes() {
   return ns;
 }
 function isHidden(n) {
+  const cf = S.view.compFilter;
+  if (cf != null && cf !== "all") {
+    const want = cf === "largest" ? largestComponentId() : cf;
+    if (n.comp !== want) return true;
+  }
   const key = S.view.colorBy;
   if (key === "__none__" || !S.view.hidden.size) return false;
   const v = key === "__community__" ? "C" + (n.m.community ?? 0) : (n.attrs[key] ?? "—");
   return S.view.hidden.has(String(v));
+}
+function largestComponentId() {
+  if (S._bigComp != null) return S._bigComp;
+  const size = new Map();
+  for (const n of S.G.nodes) size.set(n.comp, (size.get(n.comp) || 0) + 1);
+  let best = 0, bestN = -1;
+  for (const [id, sz] of size) if (sz > bestN) { bestN = sz; best = id; }
+  return (S._bigComp = best);
+}
+function componentSizes() {
+  const size = new Map();
+  for (const n of S.G.nodes) size.set(n.comp, (size.get(n.comp) || 0) + 1);
+  return [...size.entries()].sort((a, b) => b[1] - a[1]);
 }
 
 /* ========================================================== RENDERING ==== */
@@ -1928,7 +2139,8 @@ function paint(ctx, k) {
     ctx.strokeStyle = d === S.hover || d === S.selected ? "#111826"
       : (V.dark ? "rgba(255,255,255,.35)" : "rgba(255,255,255,.9)");
     ctx.stroke();
-    if (S.picked.has(d.id)) {                 // marked for export
+    if (S.picked.has(d.id) && !V.onlyPicked) {   // marked for export
+      // (rings are pointless while Isolate is on: every visible node is marked)
       ctx.beginPath(); ctx.arc(d.x, d.y, r + 4.5 / Math.max(k, .4), 0, 6.2832);
       ctx.strokeStyle = "#e4572e";
       ctx.lineWidth = 2.2 / Math.max(k, .4);
@@ -2585,6 +2797,54 @@ function louvain(G) {
   return { comm: out, Q, count: size.size };
 }
 
+/* ------------------------------------------------------- weak points ---- */
+/** Articulation points (cut vertices): nodes whose removal breaks a component
+    into pieces. For each one, report the sizes it would leave behind — the
+    difference between a node that is merely busy and one the network depends on. */
+function weakPoints(G) {
+  const { N, head } = G;
+  const adj = head.map(h => [...new Set(h.map(e => e[0]))]);
+  const compOf = new Int32Array(N).fill(-1);
+  const members = [];
+  for (let s = 0; s < N; s++) {
+    if (compOf[s] !== -1) continue;
+    const q = [s], mem = []; compOf[s] = members.length;
+    while (q.length) {
+      const v = q.pop(); mem.push(v);
+      for (const w of adj[v]) if (compOf[w] === -1) { compOf[w] = members.length; q.push(w); }
+    }
+    members.push(mem);
+  }
+  // pieces left inside a node's own component once it is removed
+  const piecesWithout = (v) => {
+    const mem = members[compOf[v]];
+    const inSet = new Set(mem), seen = new Set([v]), out = [];
+    for (const s of mem) {
+      if (seen.has(s)) continue;
+      const q = [s]; seen.add(s); let n = 0;
+      while (q.length) {
+        const u = q.pop(); n++;
+        for (const w of adj[u]) if (inSet.has(w) && !seen.has(w)) { seen.add(w); q.push(w); }
+      }
+      out.push(n);
+    }
+    return out.sort((a, b) => b - a);
+  };
+  const out = [];
+  for (let v = 0; v < N; v++) {
+    if (adj[v].length < 2) continue;                 // a leaf can never be a cut point
+    const p = piecesWithout(v);
+    if (p.length > 1) out.push({
+      node: G.nodes[v], pieces: p, was: members[compOf[v]].length,
+      cutOff: p.slice(1).reduce((a, b) => a + b, 0),
+      // how evenly it splits: 1 = perfectly in half, near 0 = shaves off a leaf
+      evenness: +(p[1] / p[0]).toFixed(3)
+    });
+  }
+  out.sort((a, b) => b.cutOff - a.cutOff || b.evenness - a.evenness);
+  return out;
+}
+
 /* -------------------------------------------------------- graph stats --- */
 function graphStats(G, weighted) {
   const { N, head, links } = G;
@@ -2609,10 +2869,17 @@ function graphStats(G, weighted) {
     }
     comps.push(size);
   }
-  comps.sort((a, b) => b - a);
+  // path statistics on the largest component (unweighted hops — the intuitive
+  // reading). Components are numbered in discovery order, so the biggest one is
+  // rarely number 0 — find it by size before measuring anything.
+  let bigId = 0, bigSize = -1;
+  const sizeOf = new Map();
+  for (let i = 0; i < N; i++) sizeOf.set(seen[i], (sizeOf.get(seen[i]) || 0) + 1);
+  for (const [id, sz] of sizeOf) if (sz > bigSize) { bigSize = sz; bigId = id; }
+  const big = [];
+  for (let i = 0; i < N; i++) if (seen[i] === bigId) big.push(i);
 
-  // path statistics on the largest component (unweighted hops — the intuitive reading)
-  const big = seen.reduce((acc, c, i) => { if (c === 0) acc.push(i); return acc; }, []);
+  comps.sort((a, b) => b - a);
   let diameter = null, avgPath = null;
   if (big.length > 1 && big.length <= 3000) {
     let sum = 0, cnt = 0, dia = 0;
@@ -2688,7 +2955,8 @@ function renderStylePanel() {
   if (!S.G) { p.innerHTML = `<p class="hint">Load a network first.</p>`; return; }
   const V = S.view;
   const ws = S.G.links.map(l => l.w);
-  const wMin = minOf(ws), wMax = maxOf(ws);
+  // an empty graph would otherwise hand the slider Infinity / -Infinity
+  const wMin = ws.length ? minOf(ws) : 0, wMax = ws.length ? maxOf(ws) : 1;
   const cats = categoricalKeys();
   const metricOpts = ["degree", "strength", ...Object.keys(METRICS), "kcore"]
     .filter((v, i, a) => a.indexOf(v) === i)
@@ -2696,7 +2964,7 @@ function renderStylePanel() {
 
   p.innerHTML = `
   <div class="sect">
-    <h3>Layout</h3>
+    <h3>Layout${helpChip("layout")}</h3>
     <div class="row">
       <select id="s-layout">
         <option value="force" ${V.layout === "force" ? "selected" : ""}>Force-directed (spring)</option>
@@ -2717,9 +2985,20 @@ function renderStylePanel() {
   <div class="sect">
     <h3>Filter</h3>
     <div class="row">
-      <label>Minimum edge weight <span class="pill" id="s-thlab">${fmt(V.threshold)}</span></label>
+      <label>Components${helpChip("components")}</label>
+      <select id="s-comp">
+        <option value="all">Show all ${S.G.componentCount} components</option>
+        <option value="largest" ${V.compFilter === "largest" ? "selected" : ""}>Largest only (${componentSizes()[0]?.[1] ?? 0} nodes)</option>
+        ${S.selected ? `<option value="sel" ${V.compFilter === S.selected.comp ? "selected" : ""}>The one containing ${esc(S.selected.label)}</option>` : ""}
+      </select>
+      <p class="hint">A network usually breaks into pieces that never touch. Narrowing to one lets the layout
+        spread it out instead of squeezing it beside everything else.</p>
+    </div>
+    <div class="row">
+      <label>Minimum edge weight <span class="pill" id="s-thlab">${fmt(V.threshold)}</span>${helpChip("threshold")}</label>
       <div class="slider">
-        <input type="range" id="s-th" min="${wMin}" max="${wMax}" step="${(wMax - wMin) / 100 || 1}" value="${V.threshold}">
+        <input type="range" id="s-th" min="${wMin}" max="${wMax}" step="${((wMax - wMin) / 100) || 1}"
+          value="${V.threshold}" ${ws.length ? "" : "disabled"}>
         <output id="s-thout">${visibleLinks().length.toLocaleString()} edges</output>
       </div>
       <p class="hint">Hides weak ties. On a dense co-occurrence network this is usually the single most useful
@@ -2730,7 +3009,7 @@ function renderStylePanel() {
   </div>
 
   <div class="sect">
-    <h3>Colour</h3>
+    <h3>Colour${helpChip("colour")}</h3>
     <div class="row">
       <select id="s-color">
         <option value="__none__" ${V.colorBy === "__none__" ? "selected" : ""}>Single colour</option>
@@ -2744,7 +3023,7 @@ function renderStylePanel() {
   </div>
 
   <div class="sect">
-    <h3>Size</h3>
+    <h3>Size${helpChip("size")}</h3>
     <div class="row">
       <select id="s-size">
         <option value="__uniform__" ${V.sizeBy === "__uniform__" ? "selected" : ""}>All the same</option>
@@ -2762,7 +3041,7 @@ function renderStylePanel() {
   </div>
 
   <div class="sect">
-    <h3>Labels</h3>
+    <h3>Labels${helpChip("labels")}</h3>
     <div class="row">
       <select id="s-labmode">
         <option value="top" ${V.labelMode === "top" ? "selected" : ""}>Only the most central nodes</option>
@@ -2803,6 +3082,12 @@ function renderStylePanel() {
   </div>`;
 
   const on = (id, ev, fn) => { const el = $(id); if (el) el.addEventListener(ev, fn); };
+  on("#s-comp", "change", e => {
+    V.compFilter = e.target.value === "all" ? null
+      : e.target.value === "sel" ? (S.selected ? S.selected.comp : null)
+        : "largest";
+    runLayout(V.layout); renderStatus(); renderLegend(); draw();
+  });
   on("#s-layout", "change", e => runLayout(e.target.value));
   on("#s-restart", "click", () => runLayout(V.layout));
   on("#s-freeze", "click", () => { if (S.sim) S.sim.stop(); });
@@ -2898,6 +3183,17 @@ const EXPLAIN = {
     (4) In a co-occurrence network each shared group is already a fully connected clique, so communities often
     trace the documents or events themselves rather than anything deeper. That is worth checking before
     interpreting them as social circles.`,
+  weak: `<b>What it finds.</b> Nodes the network cannot afford to lose. Remove one and its component falls into
+    two or more pieces that no longer reach each other — a <em>cut vertex</em>, or articulation point.
+    <b>Read it as</b> dependency rather than importance. A node with a hundred links inside one dense cluster
+    can be removed without consequence; a node with two links can be the only thing joining two halves of the
+    network. The "splits into" column is the answer to "what would be left".
+    <b>Why it is often the sharpest result.</b> Centrality scores rank everyone on a smooth scale, which
+    invites over-reading small differences. This is a yes/no structural fact: either the network survives
+    without the node or it does not.
+    <b>Watch out.</b> It is a statement about <em>this</em> record, not about the world. A person who looks
+    indispensable may simply be the only one who happened to sign two surviving documents — absence of
+    evidence for other routes is not evidence of dependence.`,
   homophily: `<b>What it measures.</b> Whether edges tend to stay inside a category or cross between categories.
     <span class="formula">E–I index = (crossing − internal) ÷ all edges</span>
     <b>Read it as</b> −1 means every tie is inside a category (complete separation); +1 means every tie crosses
@@ -2916,7 +3212,7 @@ function renderAnalysisPanel() {
 
   p.innerHTML = `
   <div class="sect">
-    <h3>Overview</h3>
+    <h3>Overview${helpChip("overview")}</h3>
     ${st ? `
       <div class="stat"><span>Nodes / edges</span><b>${st.N.toLocaleString()} / ${st.E.toLocaleString()}</b></div>
       <div class="stat"><span>Density</span><b>${fmt(st.density, 4)}</b></div>
@@ -2937,7 +3233,7 @@ function renderAnalysisPanel() {
   <div class="sect">
     <h3>Centrality &amp; structure</h3>
     <label class="chk"><input type="checkbox" id="a-weighted" ${S.useWeights ? "checked" : ""}>
-      <span>Use edge weights (a heavier tie counts as a <i>shorter</i> distance)</span></label>
+      <span>Use edge weights (a heavier tie counts as a <i>shorter</i> distance)</span></label>${helpChip("weighted")}
     <button class="btn primary wide" id="a-all" style="margin:8px 0 10px">
       Compute all metrics${heavy ? " (slow on this size)" : ""}</button>
     ${heavy ? `<div class="note warn" style="margin-bottom:10px">${S.G.nodes.length.toLocaleString()} nodes —
@@ -2972,6 +3268,16 @@ function renderAnalysisPanel() {
   </div>
 
   <div class="sect">
+    <h3>Weak points <span class="pill">what breaks it</span></h3>
+    <div id="a-weak"><button class="btn wide" id="a-weak-run">Find the nodes the network depends on</button></div>
+    <div class="metric" id="card-weak" style="margin-top:9px">
+      <button onclick="this.parentElement.classList.toggle('open')">
+        <b>How this is measured</b><span class="caret">\u203a</span></button>
+      <div class="why">${EXPLAIN.weak}</div>
+    </div>
+  </div>
+
+  <div class="sect">
     <h3>Homophily <span class="pill">who links to whom</span></h3>
     ${cats.length ? `
       <div class="row">
@@ -2990,7 +3296,7 @@ function renderAnalysisPanel() {
   </div>
 
   <div class="sect">
-    <h3>Ranking</h3>
+    <h3>Ranking${helpChip("ranking")}</h3>
     <div class="row">
       <select id="a-rankby"></select>
     </div>
@@ -3032,6 +3338,30 @@ function renderAnalysisPanel() {
   rank.value = S.rankBy;
   renderRanking();
 
+  const wk = $("#a-weak-run");
+  if (wk) wk.onclick = async () => {
+    busy(true, "Testing every node\u2026"); await nextFrame();
+    const rows = weakPoints(graphIndex());
+    busy(false);
+    const box = $("#a-weak");
+    if (!rows.length) { box.innerHTML = `<p class="hint">No cut vertices \u2014 every component here survives
+      the loss of any single node.</p>`; return; }
+    box.innerHTML = `<p class="hint" style="margin-bottom:8px"><b>${rows.length}</b> node${rows.length === 1 ? "" : "s"}
+        of ${S.G.nodes.length.toLocaleString()} would break their component in two.</p>
+      <div class="tblwrap"><table><thead><tr><th>Node</th><th class="num">links</th>
+        <th>splits into</th><th class="num">cut off</th></tr></thead><tbody>
+      ${rows.slice(0, 60).map(r => `<tr data-id="${esc(r.node.id)}">
+        <td>${esc(r.node.label)}</td><td class="num">${r.node.deg}</td>
+        <td>${r.pieces.slice(0, 4).join(" + ")}${r.pieces.length > 4 ? " \u2026" : ""} <span style="color:#8a93a2">of ${r.was}</span></td>
+        <td class="num">${r.cutOff}</td></tr>`).join("")}
+      </tbody></table></div>
+      <div class="btnrow" style="margin-top:8px"><button class="btn sm" id="a-weak-mark">Mark them all</button></div>`;
+    $$("#a-weak tr[data-id]").forEach(tr => tr.onclick = () => focusNode(S.G.byId.get(tr.dataset.id)));
+    $("#a-weak-mark").onclick = () => {
+      rows.forEach(r => S.picked.add(r.node.id));
+      renderSelectionBar(); renderExportPanel(); renderStatus(); draw();
+    };
+  };
   const hk = $("#a-homokey");
   if (hk) hk.onchange = () => { S.homoKey = hk.value; renderHomophily(); };
   renderHomophily();
@@ -3177,7 +3507,7 @@ function renderExportPanel() {
   if (!S.G) { p.innerHTML = `<p class="hint">Load a network first.</p>`; return; }
   p.innerHTML = `
   <div class="sect">
-    <h3>Picture of the current view</h3>
+    <h3>Picture of the current view${helpChip("picture")}</h3>
     <p class="hint" style="margin-bottom:9px">Exports exactly what you see on screen — same zoom, same pan,
       same filters and labels. Arrange the view first, then export.</p>
     <div class="row">
@@ -3209,7 +3539,7 @@ function renderExportPanel() {
   </div>
 
   <div class="sect">
-    <h3>Marked group <span class="pill">${S.picked.size} selected</span></h3>
+    <h3>Marked group <span class="pill">${S.picked.size} selected</span>${helpChip("marked")}</h3>
     ${S.picked.size ? `
       <p class="hint" style="margin-bottom:9px">${S.picked.size} nodes and
         ${S.G.links.filter(l => S.picked.has(l.s) && S.picked.has(l.t)).length} edges between them.</p>
@@ -3259,7 +3589,7 @@ function renderExportPanel() {
   </div>
 
   <div class="sect">
-    <h3>Session</h3>
+    <h3>Session${helpChip("session")}</h3>
     <button class="btn wide" id="x-session">Save session (.json)</button>
     <p class="hint">Stores the column mapping, every setting and the exact node positions. Re-open it from the
       Data tab to reproduce this figure precisely — useful when a reviewer asks how a figure was made.</p>
@@ -3646,6 +3976,135 @@ function copyMethods() {
     () => openModal("Methods note", `<textarea style="width:100%;height:200px;padding:10px;border:1px solid var(--line);border-radius:8px">${esc(txt)}</textarea>`, null, "", ""));
 }
 
+/* ========================================================= GUIDED TOUR === */
+/* A short walk through the interface. Runs itself the first time someone opens
+   the page, and is available afterwards from the Guide button. Each step can
+   switch tabs and load the example first, so the thing being pointed at is
+   actually on screen and populated. */
+const TOUR = [
+  {
+    title: "A quick tour — about a minute",
+    text: `This tool turns a spreadsheet into a network you can look at and measure. Nothing is uploaded:
+      your file is read inside this browser tab and never leaves your computer.`,
+    tip: "You can leave at any point with Skip or the Esc key, and come back later with the Guide button.",
+    target: "#brand", tab: "data"
+  },
+  {
+    title: "1 · Bring in a table",
+    text: `Drop a CSV here, or click to pick one. Two shapes work: one row per <b>relationship</b>
+      (person A, person B), or one row per <b>membership</b> (a person and a document, meeting or event) —
+      the second is what most historical and archival spreadsheets look like.`,
+    tip: "No file to hand? “Load example dataset” fills the tool with 350 people from Cairo Geniza legal documents.",
+    target: "#drop", tab: "data"
+  },
+  {
+    title: "2 · Say what the columns mean",
+    text: `After the file loads, a dialog asks which column holds the nodes, which holds the link or the
+      shared group, how to weigh the ties and what should appear when you hover. Nothing is guessed
+      silently, so the network you get is the one you asked for.`,
+    tip: "Everything there can be changed later with “Change column mapping”.",
+    target: '[data-panel="data"]', tab: "data", demo: true
+  },
+  {
+    title: "3 · Move around the picture",
+    text: `Scroll to zoom, drag the background to pan. Hover a node or a link to see its details. Click a
+      node to light up its immediate circle and dim everything else; click it again to release.
+      Drag a node to pin it where you want it, double-click to let it go.`,
+    tip: "Hold Shift and drag a box to mark a group of nodes — you can then download exactly that group.",
+    target: "#stage", tab: "data"
+  },
+  {
+    title: "4 · Find a specific person",
+    text: `Type any part of a name here and pick from the list — the view flies to that node and selects it.
+      Useful when you know who you are looking for and cannot see them in the tangle.`,
+    target: "#searchwrap", tab: "data"
+  },
+  {
+    title: "5 · Make it readable",
+    text: `The Style tab is where a hairball becomes a picture. Colour by any category, size by any metric,
+      choose how many names to show — and above all use the <b>minimum edge weight</b> slider, which hides
+      weak ties until the structure appears.`,
+    tip: "If the network is in several disconnected pieces, narrow to one under Components.",
+    target: '#tabs button[data-tab="style"]', tab: "style"
+  },
+  {
+    title: "6 · Measure it",
+    text: `The Analysis tab computes centralities, communities and the graph-level summary. Every measure
+      has a short explanation of what it counts, how to read it and what it hides — open the card to read it
+      before trusting the number.`,
+    tip: "“Weak points” is often the sharpest result: which nodes, if removed, break the network apart.",
+    target: '#tabs button[data-tab="analysis"]', tab: "analysis"
+  },
+  {
+    title: "7 · Take things away with you",
+    text: `Export the current view as SVG for a paper or PNG for slides, the nodes with all their metrics as
+      CSV, the whole graph for Gephi — or a session file that restores this exact figure later, positions
+      and all.`,
+    target: '#tabs button[data-tab="export"]', tab: "export"
+  },
+  {
+    title: "Wherever you see a ?",
+    text: `Small question marks sit next to the controls that deserve a sentence of explanation. Hover one
+      and it appears. That is the whole interface — go and break something.`,
+    tip: "The Guide button in the top corner replays this tour whenever you want.",
+    target: "#guide", tab: "data"
+  }
+];
+
+let tourAt = -1;
+const TOUR_KEY = "network-explorer/seen-tour";
+const tourEl = {
+  root: $("#tour"), hole: $("#tour-hole"), card: $("#tour-card"),
+  title: $("#tour-title"), text: $("#tour-text"), tip: $("#tour-tip"), dots: $("#tour-dots")
+};
+
+function startTour() { tourAt = -1; tourEl.root.classList.add("on"); tourStep(1); }
+function endTour() {
+  tourEl.root.classList.remove("on");
+  try { localStorage.setItem(TOUR_KEY, "1"); } catch (e) { /* private mode — no matter */ }
+}
+function tourStep(delta) {
+  const next = tourAt + delta;
+  if (next < 0) return;
+  if (next >= TOUR.length) return endTour();
+  tourAt = next;
+  const st = TOUR[tourAt];
+
+  if (st.demo && !S.G) loadDemo();
+  if (st.tab) showTab(st.tab);
+
+  tourEl.title.textContent = st.title;
+  tourEl.text.innerHTML = st.text;
+  tourEl.tip.innerHTML = st.tip || "";
+  tourEl.tip.style.display = st.tip ? "block" : "none";
+  tourEl.dots.innerHTML = TOUR.map((_, i) => `<i class="${i === tourAt ? "on" : ""}"></i>`).join("");
+  $("#tour-back").style.visibility = tourAt ? "visible" : "hidden";
+  $("#tour-next").textContent = tourAt === TOUR.length - 1 ? "Done" : "Next";
+
+  // let the panel finish rendering before measuring where to point
+  requestAnimationFrame(() => {
+    const el = $(st.target);
+    const r = el ? el.getBoundingClientRect() : { top: innerHeight / 2, left: innerWidth / 2, width: 0, height: 0 };
+    const pad = 6;
+    Object.assign(tourEl.hole.style, {
+      top: (r.top - pad) + "px", left: (r.left - pad) + "px",
+      width: (r.width + pad * 2) + "px", height: (r.height + pad * 2) + "px"
+    });
+    const cw = 340, ch = tourEl.card.offsetHeight || 220;
+    let left = r.right + 18, top = r.top;
+    if (left + cw > innerWidth - 14) left = r.left - cw - 18;      // flip to the other side
+    if (left < 14) left = Math.min(innerWidth - cw - 14, r.left + 14);
+    if (top + ch > innerHeight - 14) top = Math.max(14, innerHeight - ch - 14);
+    tourEl.card.style.left = left + "px";
+    tourEl.card.style.top = Math.max(14, top) + "px";
+  });
+}
+$("#tour-next").onclick = () => tourStep(1);
+$("#tour-back").onclick = () => tourStep(-1);
+$("#tour-skip").onclick = endTour;
+$("#guide").onclick = startTour;
+$("#tour-veil").onclick = endTour;
+
 /* ============================================================== INIT ===== */
 function renderAll() {
   refreshSizeExtent();
@@ -3659,7 +4118,16 @@ function renderAll() {
 }
 
 window.addEventListener("keydown", e => {
-  if (e.key === "Escape") { closeModal(); if (S.selected) { S.selected = null; renderAnalysisSelection(); draw(); } }
+  if (e.key === "Escape") {
+    if (tourEl.root.classList.contains("on")) return endTour();
+    closeModal();
+    if (S.selected) { S.selected = null; renderAnalysisSelection(); draw(); }
+  }
+  if (tourEl.root.classList.contains("on")) {
+    if (e.key === "ArrowRight" || e.key === "Enter") { e.preventDefault(); tourStep(1); }
+    if (e.key === "ArrowLeft") { e.preventDefault(); tourStep(-1); }
+    return;
+  }
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
   if (e.key === "f") fit();
   if (e.key === "/") { e.preventDefault(); searchBox.focus(); }
@@ -3667,6 +4135,11 @@ window.addEventListener("keydown", e => {
 
 sizeCanvas();
 renderAll();
+
+// first visit: offer the tour rather than dropping someone into an empty canvas
+try {
+  if (!localStorage.getItem(TOUR_KEY)) setTimeout(startTour, 550);
+} catch (e) { /* storage unavailable — skip the auto-run, the Guide button still works */ }
 /* END */
 
 </script>
