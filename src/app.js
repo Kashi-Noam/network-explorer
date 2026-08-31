@@ -12,6 +12,7 @@ const S = {
   G: null,            // {nodes, links, byId, adj}
   view: {
     layout: "force",
+    weightPull: 0.5,    // how strongly a heavier tie shortens the drawn distance
     threshold: 0,       // minimum edge weight to draw
     colorBy: "__none__",
     sizeBy: "degree",
@@ -124,9 +125,17 @@ const HELP = {
   attrs: `<b>A second table, one row per node.</b> The edge table rarely carries a person's sect, gender,
     origin or dates. Adding them here unlocks colouring, filtering and the homophily test. Rows are matched
     by name, ignoring case and spacing.`,
+  weightpull: `<b>Does a stronger tie sit closer?</b> At 0 every link is drawn the same length and only the
+    pattern of connections shapes the picture. Turning it up makes a pair who share many documents settle
+    close together and a pair who share one drift apart, so distance on screen starts to carry meaning.
+    <b>Watch out.</b> Distance in a force layout is never a measurement — it is a compromise between every
+    link at once. Use it to make structure visible, not to read off numbers.`,
   layout: `<b>Where the nodes sit.</b> Force-directed pulls connected nodes together and pushes the rest
     apart, so clusters appear by themselves. Positions have no units — only relative closeness means
-    anything, and every re-run gives a slightly different picture of the same structure.`,
+    anything, and every re-run gives a slightly different picture of the same structure.
+    <b>Core and periphery</b> answers a different question: it puts the highest-scoring nodes at the centre
+    and the weakly attested on the rim, at a radius set by whichever metric drives node size. It is a
+    ranking you can see, rather than an emergent shape.`,
   components: `<b>Pieces that never touch.</b> Most real networks are not one connected lump. Narrowing the
     view to a single component lets the layout spread it out properly instead of squashing it beside
     everything else.`,
@@ -222,22 +231,24 @@ function renderDataPanel() {
   <div class="sect">
     <h3>1 · Load a table</h3>
     <div id="drop">
-      <strong>Drop a CSV here</strong>
-      <span>or click to choose a file · .csv, .tsv, .txt</span>
+      <strong>Drop a CSV or Excel file here</strong>
+      <span>or click to choose a file · .csv, .tsv, .xlsx</span>
     </div>
-    <input type="file" id="file" accept=".csv,.tsv,.txt,text/csv" hidden>
+    <input type="file" id="file" accept=".csv,.tsv,.txt,.xlsx,.xlsm,.xls" hidden>
     <div class="btnrow" style="margin-top:9px">
       <button class="btn sm" id="demo">Load example dataset</button>
       <button class="btn sm" id="loadsession">Open a saved session</button>
       <input type="file" id="sessionfile" accept=".json" hidden>
     </div>
-    <p class="hint">Nothing is uploaded. The file is read locally by your browser and stays on your machine.</p>
+    <p class="hint">Excel files work directly — no need to save as CSV. Nothing is uploaded: the file is read
+      locally by your browser and stays on your machine.</p>
   </div>
 
   <div class="sect">
     <h3>2 · Current network</h3>
     ${loaded ? `
       <div class="stat"><span>Source file</span><b>${esc(S.raw.name)}</b></div>
+      ${S.raw.note ? `<div class="stat"><span>Read as</span><b>${esc(S.raw.note)}</b></div>` : ""}
       <div class="stat"><span>Nodes</span><b>${S.G.nodes.length.toLocaleString()}</b></div>
       <div class="stat"><span>Edges</span><b>${S.G.links.length.toLocaleString()}</b></div>
       <div class="stat"><span>Interpretation</span><b>${S.map.mode === "edges" ? "edge list" : "co-occurrence"}</b></div>
@@ -255,7 +266,7 @@ function renderDataPanel() {
     <button class="btn sm wide" id="attrbtn" ${loaded ? "" : "disabled"}>
       ${S.attrRaw ? "Replace attribute table" : "Add a second CSV with node attributes"}
     </button>
-    <input type="file" id="attrfile" accept=".csv,.tsv,.txt" hidden>
+    <input type="file" id="attrfile" accept=".csv,.tsv,.txt,.xlsx,.xlsm,.xls" hidden>
     <p class="hint">A second table — one row per node — adds properties such as sect, gender, or dates that the
       edge table does not carry. They become available for colouring, filtering and homophily.</p>
   </div>
@@ -303,25 +314,84 @@ function renderDataPanel() {
 }
 
 /* --------------------------------------------------------- file reading -- */
+/* Excel's "Save as CSV" writes the system's legacy code page, not UTF-8, so a
+   Hebrew or Arabic spreadsheet saved that way arrives as mojibake. Rather than
+   telling people to re-save, decode the bytes ourselves: try UTF-8 strictly,
+   and on failure fall back through the code pages those languages actually use. */
+const TEXT_ENCODINGS = ["utf-8", "windows-1255", "windows-1256", "windows-1251", "windows-1252"];
+function decodeText(buf) {
+  for (const enc of TEXT_ENCODINGS) {
+    try {
+      const txt = new TextDecoder(enc, { fatal: true }).decode(buf);
+      return { txt, enc };
+    } catch (e) { /* not this one */ }
+  }
+  return { txt: new TextDecoder("utf-8").decode(buf), enc: "utf-8 (with replacement characters)" };
+}
+
+const isSpreadsheet = name => /\.(xlsx|xlsm|xltx|xls)$/i.test(name);
+
+function tableFromText(text, name, note) {
+  const res = Papa.parse(text.replace(/^﻿/, "").trim(), {
+    header: true, skipEmptyLines: "greedy", dynamicTyping: false
+  });
+  const fields = (res.meta.fields || []).map(s => (s || "").replace(/^﻿/, "").trim()).filter(Boolean);
+  if (!fields.length) return null;
+  const rows = res.data.map(r => {
+    const o = {};
+    for (const k in r) o[(k || "").replace(/^﻿/, "").trim()] = r[k];
+    return o;
+  }).filter(r => fields.some(f => String(r[f] ?? "").trim() !== ""));
+  return { rows, fields, name, note };
+}
+
 function readFile(f, cb) {
   busy(true, "Reading " + f.name + "…");
-  Papa.parse(f, {
-    header: true, skipEmptyLines: "greedy", dynamicTyping: false,
-    encoding: "UTF-8",           // handles the BOM that Excel writes
-    complete: res => {
+  const fr = new FileReader();
+  fr.onerror = () => { busy(false); alert("Could not read the file."); };
+  fr.onload = () => {
+    const buf = fr.result;
+    try {
+      if (isSpreadsheet(f.name)) return readWorkbook(buf, f.name, cb);
+      const { txt, enc } = decodeText(buf);
+      const t = tableFromText(txt, f.name, enc === "utf-8" ? "" : `decoded as ${enc}`);
       busy(false);
-      const fields = (res.meta.fields || []).map(s => (s || "").replace(/^﻿/, "").trim()).filter(Boolean);
-      if (!fields.length) return alert("No columns found. Is this a CSV with a header row?");
-      // normalise keys (strip BOM/whitespace) so lookups are predictable
-      const rows = res.data.map(r => {
-        const o = {};
-        for (const k in r) o[(k || "").replace(/^﻿/, "").trim()] = r[k];
-        return o;
-      }).filter(r => fields.some(f2 => String(r[f2] ?? "").trim() !== ""));
-      cb({ rows, fields, name: f.name });
-    },
-    error: err => { busy(false); alert("Could not read the file: " + err.message); }
-  });
+      if (!t) return alert("No columns found. Does the first row hold the column names?");
+      if (enc !== "utf-8") toast(`This file was not saved as UTF-8, so the text would normally arrive as “????”. ` +
+        `Read it as ${enc} instead — check that the names below look right.`);
+      cb(t);
+    } catch (err) { busy(false); alert("Could not read the file: " + err.message); }
+  };
+  fr.readAsArrayBuffer(f);
+}
+
+/** Excel files: read every sheet, use the only one, or let the user choose. */
+function readWorkbook(buf, name, cb) {
+  if (typeof XLSX === "undefined") {
+    busy(false);
+    return alert("The spreadsheet reader did not load. Check your internet connection, or save the file as CSV UTF-8.");
+  }
+  const wb = XLSX.read(buf, { type: "array" });
+  const sheets = wb.SheetNames.map(sn => {
+    const csv = XLSX.utils.sheet_to_csv(wb.Sheets[sn], { blankrows: false });
+    return { sn, csv, table: tableFromText(csv, `${name} — ${sn}`, "from Excel") };
+  }).filter(s => s.table && s.table.rows.length);
+  busy(false);
+  if (!sheets.length) return alert("No sheet in this workbook has a header row and data under it.");
+  if (sheets.length === 1) { toast(`Read the sheet “${sheets[0].sn}” — ${sheets[0].table.rows.length.toLocaleString()} rows.`); return cb(sheets[0].table); }
+  openModal("Which sheet?", `
+    <p class="hint" style="margin-bottom:12px">${esc(name)} has ${sheets.length} sheets with data in them.</p>
+    ${sheets.map((s, i) => `<div class="modecard ${i === 0 ? "on" : ""}" data-sheet="${i}" style="margin-bottom:8px">
+        <b>${esc(s.sn)}</b>
+        <span>${s.table.rows.length.toLocaleString()} rows · ${s.table.fields.length} columns ·
+          ${esc(s.table.fields.slice(0, 5).join(", "))}${s.table.fields.length > 5 ? " …" : ""}</span>
+      </div>`).join("")}`,
+    () => {
+      const i = +$(".modecard.on").dataset.sheet;
+      closeModal();
+      cb(sheets[i].table);
+    }, "Use this sheet");
+  $$(".modecard").forEach(c => c.onclick = () => $$(".modecard").forEach(x => x.classList.toggle("on", x === c)));
 }
 
 function parseCSVText(text, name) {
@@ -825,6 +895,44 @@ function runLayout(kind = S.view.layout) {
     fit(); draw(); return;
   }
 
+  if (kind === "radial") {
+    // Core and periphery: distance from the centre is set by a metric, so the
+    // people who appear once sit on the rim and the well-connected sit in the
+    // middle. Angle is grouped by community (or the colour attribute) so that
+    // the ring is not an arbitrary scatter.
+    const key = S.sizeExtent?.[S.view.sizeBy] ? S.view.sizeBy : "degree";
+    const ext = S.sizeExtent?.[key] || [0, 1];
+    const groupOf = d => S.view.colorBy === "__community__" ? (d.m.community ?? 0)
+      : S.view.colorBy !== "__none__" ? (d.attrs[S.view.colorBy] ?? "—") : 0;
+    const groups = [...new Set(nodes.map(groupOf))];
+    const gi = new Map(groups.map((g, i) => [g, i]));
+    const R = 90 + n * 2.1;
+    // order inside each wedge by the metric so the ring is tidy
+    const byGroup = new Map(groups.map(g => [g, []]));
+    for (const d of nodes) byGroup.get(groupOf(d)).push(d);
+    for (const [g, list] of byGroup) {
+      list.sort((a, b) => (b.m[key] ?? 0) - (a.m[key] ?? 0));
+      const span = (2 * Math.PI) / groups.length;
+      const base = gi.get(g) * span;
+      list.forEach((d, i) => {
+        const v = ext[1] > ext[0] ? ((d.m[key] ?? 0) - ext[0]) / (ext[1] - ext[0]) : 0;
+        const r = R * (1 - Math.sqrt(v)) + 26;          // high metric → near the centre
+        const a = base + span * ((i + 0.5) / list.length) * 0.92;
+        d.x = Math.cos(a) * r; d.y = Math.sin(a) * r; d.fx = d.fy = null;
+      });
+    }
+    // a short relaxation so labels stop colliding, without destroying the rings
+    const rl = d3.forceSimulation(nodes)
+      .force("collide", d3.forceCollide(d => radiusOf(d) + 3).iterations(3))
+      .force("r", d3.forceRadial(d => {
+        const v = ext[1] > ext[0] ? ((d.m[key] ?? 0) - ext[0]) / (ext[1] - ext[0]) : 0;
+        return R * (1 - Math.sqrt(v)) + 26;
+      }).strength(.8))
+      .stop();
+    for (let i = 0; i < 120; i++) rl.tick();
+    fit(); draw(); return;
+  }
+
   // force-directed.
   // Two things keep a dense co-occurrence graph from collapsing into a blob:
   //  · link strength is divided by the smaller endpoint degree (d3's own rule),
@@ -837,7 +945,14 @@ function runLayout(kind = S.view.layout) {
   const home = componentHomes(nodes);
   S.sim = d3.forceSimulation(nodes)
     .force("link", d3.forceLink(links).id(d => d.id)
-      .distance(l => 34 + 26 * (1 - l.w / maxW))
+      // A tie carrying more shared documents is drawn shorter. The spread is
+      // controllable because on some data the difference should dominate the
+      // picture and on others it should barely show.
+      .distance(l => {
+        const pull = S.view.weightPull;                 // 0 = ignore weight, 1 = strong
+        const t = maxW > 1 ? (l.w - 1) / (maxW - 1) : 0;
+        return 24 + (26 + 90 * pull) * (1 - t * pull);
+      })
       .strength(l => (0.25 + 0.5 * (l.w / maxW)) /
         Math.max(1, Math.min(l.source.deg || 1, l.target.deg || 1))))
     .force("charge", d3.forceManyBody()
@@ -1877,10 +1992,18 @@ function renderStylePanel() {
         <option value="force" ${V.layout === "force" ? "selected" : ""}>Force-directed (spring)</option>
         <option value="communities" ${V.layout === "communities" ? "selected" : ""}>Force, grouped by community</option>
         <option value="circle" ${V.layout === "circle" ? "selected" : ""}>Circle, ranked by size metric</option>
+        <option value="radial" ${V.layout === "radial" ? "selected" : ""}>Core and periphery (central nodes in the middle)</option>
         <option value="grid" ${V.layout === "grid" ? "selected" : ""}>Separate clusters per category</option>
       </select>
       <p class="hint">Force-directed pulls connected nodes together and pushes everything else apart, so clusters
         appear on their own. Positions carry no units — only relative closeness means something.</p>
+    </div>
+    <div class="row">
+      <label>Shared ties pull closer${helpChip("weightpull")}</label>
+      <div class="slider">
+        <input type="range" id="s-pull" min="0" max="1" step="0.05" value="${V.weightPull}">
+        <output>${Math.round(V.weightPull * 100)}%</output>
+      </div>
     </div>
     <div class="btnrow">
       <button class="btn sm" id="s-restart">Re-run layout</button>
@@ -1995,6 +2118,11 @@ function renderStylePanel() {
         : "largest";
     runLayout(V.layout); renderStatus(); renderLegend(); draw();
   });
+  on("#s-pull", "input", e => {
+    V.weightPull = +e.target.value;
+    e.target.nextElementSibling.textContent = Math.round(V.weightPull * 100) + "%";
+  });
+  on("#s-pull", "change", () => { if (V.layout === "force" || V.layout === "communities") runLayout(V.layout); });
   on("#s-layout", "change", e => runLayout(e.target.value));
   on("#s-restart", "click", () => runLayout(V.layout));
   on("#s-freeze", "click", () => { if (S.sim) S.sim.stop(); });
