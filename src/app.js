@@ -36,7 +36,10 @@ const S = {
   box: null,            // the box being dragged, in screen coordinates
   palette: {},          // category value -> colour
   metricsDone: new Set(),
-  stats: null
+  stats: null,
+  louvainSeed: 1,       // fixed by default so community detection is reproducible
+  frozen: false,
+  autoFit: true
 };
 
 const CANVAS = document.getElementById("cv");
@@ -441,6 +444,23 @@ function guessCol(fields, patterns, fallbackIdx) {
   return fields[fallbackIdx] ?? fields[0];
 }
 
+/* Column-name pairs that mean "this table already is an edge list". */
+const EDGE_PAIRS = [
+  [/^source$/i, /^target$/i],
+  [/^from$/i, /^to$/i],
+  [/^node ?_?1$/i, /^node ?_?2$/i],
+  [/^person[ _]a$/i, /^person[ _]b$/i]
+];
+/** The two columns of an edge list, if this table has an obvious pair. */
+function detectEdgePair(fields) {
+  for (const [ra, rb] of EDGE_PAIRS) {
+    const a = fields.find(f => ra.test(String(f).trim()));
+    const b = fields.find(f => rb.test(String(f).trim()));
+    if (a && b && a !== b) return [a, b];
+  }
+  return null;
+}
+
 function openMapper() {
   const F = S.raw.fields, prev = S.map || {};
   const opts = (sel) => F.map(f => `<option value="${esc(f)}" ${f === sel ? "selected" : ""}>${esc(f)}</option>`).join("");
@@ -449,9 +469,21 @@ function openMapper() {
     return vals.length && vals.every(v => !Number.isNaN(parseFloat(v)));
   });
 
-  const mode = prev.mode || "co";
-  const a = prev.a || guessCol(F, ["^source$", "^from$", "person", "name", "actor", "node", "id$"], 0);
-  const b = prev.b || guessCol(F, ["^target$", "^to$", "document", "shelfmark", "event", "group", "title"], 1);
+  // A remembered mapping only applies to a table that still has those columns.
+  // Without this check a second file falls back to the first option in both
+  // selects — the same column for source and target, which builds nothing.
+  const has = c => c != null && F.includes(c);
+  const kept = has(prev.a) && has(prev.b);
+  const pair = detectEdgePair(F);
+  const mode = kept && prev.mode ? prev.mode : (pair ? "edges" : "co");
+  let a = kept ? prev.a
+    : (mode === "edges" && pair) ? pair[0]
+      : guessCol(F, ["^source$", "^from$", "person", "name", "actor", "node", "id$"], 0);
+  let b = kept ? prev.b
+    : (mode === "edges" && pair) ? pair[1]
+      : guessCol(F, ["^target$", "^to$", "document", "shelfmark", "event", "group", "title"], 1);
+  // neither mode can do anything with one column used twice
+  if (a === b) { const other = F.find(f => f !== a); if (other) b = other; }
 
   const previewCols = F.slice(0, 8);
   const preview = `
@@ -569,6 +601,14 @@ function openMapper() {
     $("#lab-a").textContent = co ? "Node column (who / what becomes a node)" : "Source node column";
     $("#lab-b").textContent = co ? "Group column (what they share)" : "Target node column";
     $("#dir-row").style.display = co ? "none" : "";
+    // whichever mode is picked, the two selects must not sit on the same column
+    if ($("#m-a").value === $("#m-b").value) {
+      const guess = !co ? detectEdgePair(F) : null;
+      const A = guess ? guess[0] : $("#m-a").value;
+      const B = guess ? guess[1] : F.find(f => f !== A);
+      if (A) $("#m-a").value = A;
+      if (B) $("#m-b").value = B;
+    }
   });
 }
 
@@ -722,6 +762,13 @@ function build() {
   seedLayout();
   if (S.attrRaw && S.map.attrKey) attachAttributes();
 
+  // A new network starts moving from scratch: the previous simulation may have
+  // been frozen (or stopped by hand) and nothing would ever restart it, so the
+  // new graph would sit motionless on its seed positions. Pins go too.
+  if (S.sim) { S.sim.stop(); S.sim = null; }
+  for (const n of nodeList) { n.fx = n.fy = null; }
+  S.frozen = false;
+  S.louvainSeed = 1;                    // reproducible community detection per network
   S.metricsDone.clear(); S.stats = null; S.selected = null;
   S.picked.clear(); S.view.onlyPicked = false;
   // the previous network's metrics and component numbers are gone; anything
@@ -734,8 +781,10 @@ function build() {
   S.view.threshold = 0;
   S.view.hidden.clear();
   computeBasics();
+  refreshSizeExtent();
   $("#empty").style.display = nodeList.length ? "none" : "flex";
   busy(false);
+  if (nodeList.length) runLayout(S.view.layout);
 
   // say something useful instead of leaving the user with a blank canvas
   if (!nodeList.length) {
@@ -855,6 +904,7 @@ function seedLayout() {
 
 function runLayout(kind = S.view.layout) {
   if (!S.G) return;
+  S.frozen = false;
   S.view.layout = kind;
   if (S.sim) { S.sim.stop(); S.sim = null; }
   const { nodes } = S.G;
@@ -900,16 +950,29 @@ function runLayout(kind = S.view.layout) {
     // people who appear once sit on the rim and the well-connected sit in the
     // middle. Angle is grouped by community (or the colour attribute) so that
     // the ring is not an arbitrary scatter.
+    // Only the nodes actually on screen may take part: with a component filter
+    // on, ranking and placing the whole node array leaves the visible ones
+    // bunched at a handful of angles, so the rings come out as straight rays.
+    const vis = visibleNodes();
+    const ring = vis.length ? vis : nodes;
+    const vn = ring.length;
     const key = S.sizeExtent?.[S.view.sizeBy] ? S.view.sizeBy : "degree";
-    const ext = S.sizeExtent?.[key] || [0, 1];
+    // the metric range is taken over the visible nodes too, otherwise a filtered
+    // subset is squeezed into whatever slice of the full range it happens to use
+    let lo = Infinity, hi = -Infinity;
+    for (const d of ring) {
+      const v = d.m[key];
+      if (typeof v === "number" && Number.isFinite(v)) { if (v < lo) lo = v; if (v > hi) hi = v; }
+    }
+    const ext = lo <= hi ? [lo, hi] : [0, 1];
     const groupOf = d => S.view.colorBy === "__community__" ? (d.m.community ?? 0)
       : S.view.colorBy !== "__none__" ? (d.attrs[S.view.colorBy] ?? "—") : 0;
-    const groups = [...new Set(nodes.map(groupOf))];
+    const groups = [...new Set(ring.map(groupOf))];
     const gi = new Map(groups.map((g, i) => [g, i]));
-    const R = 90 + n * 2.1;
+    const R = 90 + vn * 2.1;
     // order inside each wedge by the metric so the ring is tidy
     const byGroup = new Map(groups.map(g => [g, []]));
-    for (const d of nodes) byGroup.get(groupOf(d)).push(d);
+    for (const d of ring) byGroup.get(groupOf(d)).push(d);
     for (const [g, list] of byGroup) {
       list.sort((a, b) => (b.m[key] ?? 0) - (a.m[key] ?? 0));
       const span = (2 * Math.PI) / groups.length;
@@ -922,7 +985,7 @@ function runLayout(kind = S.view.layout) {
       });
     }
     // a short relaxation so labels stop colliding, without destroying the rings
-    const rl = d3.forceSimulation(nodes)
+    const rl = d3.forceSimulation(ring)
       .force("collide", d3.forceCollide(d => radiusOf(d) + 3).iterations(3))
       .force("r", d3.forceRadial(d => {
         const v = ext[1] > ext[0] ? ((d.m[key] ?? 0) - ext[0]) / (ext[1] - ext[0]) : 0;
@@ -963,7 +1026,7 @@ function runLayout(kind = S.view.layout) {
     .force("collide", d3.forceCollide(d => radiusOf(d) + 3).iterations(2))
     .alpha(1).alphaDecay(0.018)
     .on("tick", draw)
-    .on("end", () => { draw(); });
+    .on("end", () => { draw(); if (S.autoFit) fit(); });
 
   if (S.view.layout === "communities" && S.metricsDone.has("community")) {
     const cs = new Map();
@@ -977,7 +1040,8 @@ function runLayout(kind = S.view.layout) {
     S.sim.force("cx", d3.forceX(d => cxy.get(d.m.community ?? 0)[0]).strength(.16))
       .force("cy", d3.forceY(d => cxy.get(d.m.community ?? 0)[1]).strength(.16));
   }
-  setTimeout(fit, 700);
+  S.autoFit = true;
+  setTimeout(() => { if (S.autoFit) fit(); }, 700);
 }
 
 /** Where each connected component should sit: the largest in the middle, the
@@ -1057,15 +1121,24 @@ function sizeCanvas() {
 }
 window.addEventListener("resize", sizeCanvas);
 
+const MIN_R = 3;            // a node smaller than this is invisible, and the force
+                            // layout reads the radius for collision and repulsion
 function radiusOf(d) {
   const key = S.view.sizeBy;
-  if (key === "__uniform__") return 5 * S.view.sizeScale;
+  const plain = Math.max(MIN_R, 5 * S.view.sizeScale);
+  if (key === "__uniform__") return plain;
   const v = d.m[key];
-  if (v == null) return 5 * S.view.sizeScale;
+  if (v == null || !Number.isFinite(v)) return plain;
   const ext = S.sizeExtent?.[key];
-  if (!ext) return 5 * S.view.sizeScale;
-  const t = ext[1] > ext[0] ? (v - ext[0]) / (ext[1] - ext[0]) : 0;
-  return (3.2 + 13 * Math.sqrt(t)) * S.view.sizeScale;
+  if (!ext) return plain;
+  let t = ext[1] > ext[0] ? (v - ext[0]) / (ext[1] - ext[0]) : 0;
+  // Betweenness (and clustering, and k-core on a sparse graph) is exactly 0 for
+  // most nodes in most networks. Mapping that straight onto the bottom of the
+  // scale makes those nodes vanish and, because collision and charge are driven
+  // by this radius, lets the whole picture collapse into a ball. Keep a floor
+  // under the mapped value so a zero still draws as a proper dot.
+  t = 0.12 + 0.88 * Math.max(0, Math.min(1, t));
+  return Math.max(MIN_R, (3.2 + 13 * Math.sqrt(t)) * S.view.sizeScale);
 }
 function refreshSizeExtent() {
   S.sizeExtent = {};
@@ -1255,12 +1328,28 @@ function labelSet(nodes) {
 const zoom = d3.zoom().scaleExtent([0.02, 14])
   // the wheel always zooms; a drag pans unless we are marquee-selecting
   .filter(ev => ev.type === "wheel" ? true : !(ev.button || S.selectMode || ev.shiftKey))
-  .on("zoom", ev => { S.tf = ev.transform; draw(); });
+  // a zoom or pan done by hand cancels the automatic fit that follows a layout
+  .on("zoom", ev => { S.tf = ev.transform; if (ev.sourceEvent) S.autoFit = false; draw(); });
 d3.select(CANVAS).call(zoom).on("dblclick.zoom", null);
 
-function fit(pad = 60) {
+/** opts.settle: the fit was asked for by hand, so run an unfinished force layout
+    forward first — a box measured mid-flight is stale by the time the zoom
+    transition lands, which is what leaves part of the graph off-canvas. */
+function fit(pad = 60, opts = {}) {
   if (!S.G || !S.G.nodes.length) return;
-  const ns = visibleNodes().length ? visibleNodes() : S.G.nodes;
+  const live = () => S.sim && S.sim.alpha() > S.sim.alphaMin();
+  if (opts.settle && live()) {
+    // run the layout forward, but never hang the tab on a very large graph
+    const t0 = Date.now();
+    while (live() && Date.now() - t0 < 1500) S.sim.tick();
+    if (!live()) S.sim.stop();          // simulation.tick() fires no events of its own
+    draw();
+  }
+  const vis = visibleNodes();
+  const all = vis.length ? vis : S.G.nodes;
+  // read the positions as they are right now, and ignore any that are not usable
+  const ns = all.filter(d => Number.isFinite(d.x) && Number.isFinite(d.y));
+  if (!ns.length) return;
   const x0 = minOf(ns, d => d.x), x1 = maxOf(ns, d => d.x);
   const y0 = minOf(ns, d => d.y), y1 = maxOf(ns, d => d.y);
   const r = STAGE.getBoundingClientRect();
@@ -1269,11 +1358,13 @@ function fit(pad = 60) {
   const t = d3.zoomIdentity
     .translate(r.width / 2 - k * (x0 + x1) / 2, r.height / 2 - k * (y0 + y1) / 2)
     .scale(k);
-  d3.select(CANVAS).transition().duration(400).call(zoom.transform, t);
+  // a graph still in motion is framed at once: a 400ms glide would land on a
+  // box that has already moved on
+  d3.select(CANVAS).transition().duration(live() ? 0 : 400).call(zoom.transform, t);
 }
 $("#zin").onclick = () => d3.select(CANVAS).transition().duration(220).call(zoom.scaleBy, 1.5);
 $("#zout").onclick = () => d3.select(CANVAS).transition().duration(220).call(zoom.scaleBy, 1 / 1.5);
-$("#zfit").onclick = () => fit();
+$("#zfit").onclick = () => fit(60, { settle: true });
 
 function atPoint(mx, my) {
   if (!S.G) return { node: null, link: null };
@@ -1739,8 +1830,20 @@ const METRICS = {
 };
 
 /* ------------------------------------------------------------- Louvain -- */
-function louvain(G) {
+/** Louvain visits nodes in a shuffled order, so an unseeded run gives a
+    different community count every time. The seed defaults to a fixed value;
+    "Run again" advances it, which is what makes that button meaningful. */
+function louvain(G, seed = S.louvainSeed ?? 1) {
   const { N, head } = G;
+  // mulberry32 — small, fast, and good enough to shuffle a visiting order
+  let rs = (Math.imul(seed | 0, 0x9e3779b9) ^ 0x6d2b79f5) >>> 0;
+  const rnd = () => {
+    rs = (rs + 0x6d2b79f5) >>> 0;
+    let t = rs;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
   // collapse to a simple weighted adjacency
   let adj = head.map(h => {
     const m = new Map();
@@ -1765,7 +1868,11 @@ function louvain(G) {
 
     do {
       improved = false; pass++;
-      const order = [...Array(n).keys()].sort(() => Math.random() - .5);
+      const order = [...Array(n).keys()];
+      for (let i = order.length - 1; i > 0; i--) {   // Fisher–Yates, seeded
+        const j = Math.floor(rnd() * (i + 1));
+        const t = order[i]; order[i] = order[j]; order[j] = t;
+      }
       for (const v of order) {
         const cv = comm[v];
         sTot[cv] -= k[v];
@@ -2124,8 +2231,8 @@ function renderStylePanel() {
   });
   on("#s-pull", "change", () => { if (V.layout === "force" || V.layout === "communities") runLayout(V.layout); });
   on("#s-layout", "change", e => runLayout(e.target.value));
-  on("#s-restart", "click", () => runLayout(V.layout));
-  on("#s-freeze", "click", () => { if (S.sim) S.sim.stop(); });
+  on("#s-restart", "click", () => { S.frozen = false; runLayout(V.layout); });
+  on("#s-freeze", "click", () => { S.frozen = true; S.autoFit = false; if (S.sim) S.sim.stop(); });
   on("#s-unpin", "click", () => {
     S.G.nodes.forEach(n => n.fx = n.fy = null);
     if (S.sim) S.sim.alpha(.4).restart(); draw();
@@ -2358,7 +2465,11 @@ function renderAnalysisPanel() {
   $("#a-all").onclick = () => runMetrics(["betweenness", "closeness", "eigenvector", "pagerank", "clustering", "kcore", "community"]);
   $$("#a-metrics .run").forEach(b => b.onclick = e => { e.stopPropagation(); runMetrics([b.dataset.k]); });
   const commRun = $("#a-comm-run") || $("#a-comm-rerun");
-  if (commRun) commRun.onclick = () => runMetrics(["community"]);
+  if (commRun) commRun.onclick = () => {
+    // a first run uses the default seed; "Run again" moves to the next one
+    if (commRun.id === "a-comm-rerun") S.louvainSeed = (S.louvainSeed ?? 1) + 1;
+    runMetrics(["community"]);
+  };
   const commCol = $("#a-comm-colour");
   if (commCol) commCol.onclick = () => {
     S.view.colorBy = "__community__"; applyColours(); S.view.hidden.clear();
@@ -2483,8 +2594,17 @@ function renderHomophily() {
   const key = S.homoKey;
   if (!key) { box.innerHTML = ""; return; }
   const h = homophily(S.G, key);
-  const dir = h.EI == null ? "" : h.EI < -0.2 ? "strongly inward-facing"
-    : h.EI < 0 ? "leaning inward" : h.EI < 0.2 ? "close to balanced" : "strongly outward-facing";
+  // The raw E–I index goes negative as soon as most ties fall inside a category,
+  // which happens by chance whenever one category is large. The headline has to
+  // read the same comparison as the sentence under it — observed against what
+  // the category sizes alone would produce — or the two contradict each other.
+  const gap = (h.observed == null) ? null : h.observed - h.expected;
+  const dir = gap == null ? ""
+    : gap > 0.10 ? "strongly inward-facing"
+      : gap > 0.02 ? "leaning inward"
+        : gap < -0.10 ? "strongly outward-facing"
+          : gap < -0.02 ? "leaning outward"
+            : "close to what the category sizes alone produce";
   box.innerHTML = `
     <div class="stat"><span>Ties inside a category</span><b>${h.internal.toLocaleString()}</b></div>
     <div class="stat"><span>Ties crossing categories</span><b>${h.external.toLocaleString()}</b></div>
@@ -2493,11 +2613,12 @@ function renderHomophily() {
     <div class="stat"><span>Internal share, expected by chance</span><b>${fmt(100 * h.expected, 1)}%</b></div>
     ${h.missing ? `<div class="stat"><span>Edges skipped (value missing)</span><b>${h.missing}</b></div>` : ""}
     <div class="note" style="margin:9px 0">The network is <b>${dir}</b> on “${esc(key)}”.
-      ${h.observed > h.expected + 0.02
+      ${gap > 0.02
       ? `Ties stay inside a category more often than category sizes alone would produce.`
-      : h.observed < h.expected - 0.02
+      : gap < -0.02
         ? `Ties cross categories more often than category sizes alone would produce.`
-        : `That is about what the category sizes alone would produce.`}</div>
+        : `Most ties may still land inside a category simply because some categories are large —
+           that is what the expected share above accounts for.`}</div>
     <div class="tblwrap" style="max-height:180px"><table>
       <thead><tr><th>${esc(key)}</th><th class="num">nodes</th><th class="num">internal ties</th><th class="num">% internal</th></tr></thead>
       <tbody>${h.perVal.slice(0, 25).map(r => `<tr style="cursor:default">
@@ -2979,6 +3100,7 @@ function loadSession(file) {
     S.picked = new Set(d.picked || []);
     S.modularity = d.modularity; S.communityCount = d.communityCount; S.stats = d.stats;
     S.view = { ...S.view, ...d.view, hidden: new Set(d.view.hidden || []) };
+    S.autoFit = false;                  // the saved transform is the one we want
     if (S.sim) { S.sim.stop(); S.sim = null; }
     refreshSizeExtent(); applyColours();
     if (d.transform) { S.tf = d3.zoomIdentity.translate(d.transform.x, d.transform.y).scale(d.transform.k); }
@@ -3164,7 +3286,7 @@ window.addEventListener("keydown", e => {
     return;
   }
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
-  if (e.key === "f") fit();
+  if (e.key === "f") fit(60, { settle: true });
   if (e.key === "/") { e.preventDefault(); searchBox.focus(); }
 });
 
