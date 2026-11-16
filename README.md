@@ -32,6 +32,15 @@ columns, how edges should be weighted, how duplicate pairs are merged, whether
 the network is directed, and which columns appear when you hover over a node or
 an edge. Nothing is guessed silently.
 
+Edges can be weighted three ways: by counting rows, by summing a number column,
+or by **a weight for each value of a text column**. Pick, say, an `action`
+column and the dialog lists its values with a number box beside each — type
+`signs = 1`, `appears = 2`, and every row weighs what its action is worth. In
+co-occurrence mode an edge joins two rows of the same group, each with its own
+weight, so you also choose how they combine: the smaller, the average, the
+larger, or the product. The choice is saved in the session file and written
+into the methods note.
+
 **3 · Draws the network.** Scroll to zoom, drag to pan, drag a node to pin it in
 place, double-click to release it. Click a node to light up its ego network and
 dim everything else. Search by name. Four layouts: force-directed, force grouped

@@ -965,8 +965,14 @@ const HELP = {
     <b>co-occurrence list</b> — everyone sharing a document, meeting or event gets linked, and the edge
     weight counts how many they share. Most spreadsheets in the humanities are the second kind.`,
   weight: `<b>How strong a tie is.</b> The default counts how often the two appear together. Choosing a
-    number column instead sums that column. Weight drives edge thickness, the threshold slider, and
-    (optionally) the distance used by betweenness and closeness.`,
+    number column instead sums that column. Choosing <i>a weight for each value</i> of a text column —
+    say an "action" column — lets you type the number each value is worth (signs = 1, appears = 2), and
+    every row then weighs what its value is worth. Weight drives edge thickness, the threshold slider,
+    and (optionally) the distance used by betweenness and closeness.`,
+  pairrule: `<b>Two people, two weights, one edge.</b> In a co-occurrence table each row carries its own
+    weight, but an edge joins two rows — the two people in the same group. This picks the edge's weight
+    from theirs: the smaller (a tie is only as strong as its weaker side), the average, the larger, or
+    the product (which rewards ties where <i>both</i> sides weigh a lot).`,
   agg: `<b>When the same pair appears twice.</b> Two rows linking the same two people are merged into one
     edge. This decides whether the weights add up, or the largest wins, or they are averaged.`,
   directed: `<b>Does direction matter?</b> Tick this only if A→B means something different from B→A —
@@ -1318,6 +1324,21 @@ function openMapper() {
     const vals = S.raw.rows.slice(0, 200).map(r => r[f]).filter(v => String(v ?? "").trim() !== "");
     return vals.length && vals.every(v => !Number.isNaN(parseFloat(v)));
   });
+  // Text columns with a short list of values (an "action", "role" or "type"
+  // column) can be weighted value by value: the user types what each is worth.
+  const catValues = {};
+  for (const f of F) {
+    if (numericish.includes(f)) continue;
+    const c = new Map();
+    for (const r of S.raw.rows) {
+      const v = catKey(r[f]);
+      c.set(v, (c.get(v) || 0) + 1);
+      if (c.size > CAT_MAX) break;
+    }
+    if (c.size >= 2 && c.size <= CAT_MAX) catValues[f] = [...c.entries()].sort((x, y) => y[1] - x[1]);
+  }
+  const prevW = prev.weightCol === "__cat__" && catValues[prev.weightCat] ? "cat:" + prev.weightCat
+    : (numericish.includes(prev.weightCol) ? prev.weightCol : "__count__");
 
   // A remembered mapping only applies to a table that still has those columns.
   // Without this check a second file falls back to the first option in both
@@ -1380,7 +1401,8 @@ function openMapper() {
           <label>Edge weight${helpChip("weight")}</label>
           <select id="m-w">
             <option value="__count__">Count of shared rows (each row counts 1)</option>
-            ${numericish.map(f => `<option value="${esc(f)}" ${prev.weightCol === f ? "selected" : ""}>Sum values of “${esc(f)}”</option>`).join("")}
+            ${numericish.map(f => `<option value="${esc(f)}" ${prevW === f ? "selected" : ""}>Sum values of “${esc(f)}”</option>`).join("")}
+            ${Object.keys(catValues).map(f => `<option value="cat:${esc(f)}" ${prevW === "cat:" + f ? "selected" : ""}>Set a weight for each value of “${esc(f)}”</option>`).join("")}
           </select>
           <p class="hint">How strongly two nodes are tied. The default counts how often they appear together.</p>
         </div>
@@ -1394,6 +1416,25 @@ function openMapper() {
           </select>
           <p class="hint">Duplicate pairs are merged into one edge using this rule.</p>
         </div>
+      </div>
+
+      <div class="row" id="catw-row" style="display:none">
+        <label id="catw-lab">Weight of each value</label>
+        <div class="tblwrap" style="max-height:220px"><table>
+          <thead><tr><th>Value</th><th>Rows</th><th style="width:110px">Weight</th></tr></thead>
+          <tbody id="catw-body"></tbody></table></div>
+        <p class="hint">Every row weighs what its value is worth. A value set to 0 adds nothing to an edge.</p>
+      </div>
+
+      <div class="row" id="pair-row" style="display:none">
+        <label>Combine the two people's weights${helpChip("pairrule")}</label>
+        <select id="m-pair">
+          <option value="min">The smaller of the two</option>
+          <option value="mean">Their average</option>
+          <option value="max">The larger of the two</option>
+          <option value="product">Multiply them</option>
+        </select>
+        <p class="hint">In co-occurrence mode an edge joins two rows of the same group, each with its own weight.</p>
       </div>
 
       <div class="row" id="dir-row" style="${mode === "co" ? "display:none" : ""}">
@@ -1424,10 +1465,19 @@ function openMapper() {
       </div>
     </div>`,
     () => {
+      const wv = $("#m-w").value, isCat = wv.startsWith("cat:");
+      const weightValues = {};
+      if (isCat) for (const inp of $$("#catw-body input")) {
+        const x = parseFloat(inp.value);
+        if (!Number.isFinite(x)) return alert(`Give “${inp.dataset.v}” a number.`);
+        weightValues[inp.dataset.v] = x;
+      }
       const m = {
         mode: $(".modecard.on").dataset.mode,
         a: $("#m-a").value, b: $("#m-b").value,
-        weightCol: $("#m-w").value, agg: $("#m-agg").value,
+        weightCol: isCat ? "__cat__" : wv, agg: $("#m-agg").value,
+        weightCat: isCat ? wv.slice(4) : null, weightValues: isCat ? weightValues : null,
+        pairRule: $("#m-pair").value,
         directed: $("#m-dir").checked,
         nodeInfo: $$("#m-nodeinfo input:checked").map(i => i.value),
         edgeInfo: $$("#m-edgeinfo input:checked").map(i => i.value),
@@ -1444,6 +1494,26 @@ function openMapper() {
     "Everything here can be changed later.");
 
   if (prev.agg) $("#m-agg").value = prev.agg;
+  if (prev.pairRule) $("#m-pair").value = prev.pairRule;
+
+  // the per-value table and the pair rule appear only when they mean something
+  const syncWeightUI = () => {
+    const wv = $("#m-w").value, co = $(".modecard.on").dataset.mode === "co";
+    const col = wv.startsWith("cat:") ? wv.slice(4) : null;
+    $("#catw-row").style.display = col ? "" : "none";
+    $("#pair-row").style.display = co && wv !== "__count__" ? "" : "none";
+    if (!col) return;
+    const body = $("#catw-body");
+    if (body.dataset.col === col) return;          // keep what the user already typed
+    body.dataset.col = col;
+    const old = prev.weightCat === col ? prev.weightValues || {} : {};
+    $("#catw-lab").textContent = `Weight of each value of “${col}”`;
+    body.innerHTML = catValues[col].map(([v, n]) => `<tr><td>${v === CAT_BLANK ? "<i>(blank)</i>" : esc(v)}</td>
+      <td>${n.toLocaleString()}</td><td><input type="number" step="any" data-v="${esc(v)}"
+      value="${old[v] ?? 1}" style="width:90px"></td></tr>`).join("");
+  };
+  $("#m-w").onchange = syncWeightUI;
+  syncWeightUI();
 
   $$(".modecard").forEach(c => c.onclick = () => {
     $$(".modecard").forEach(x => x.classList.toggle("on", x === c));
@@ -1451,6 +1521,7 @@ function openMapper() {
     $("#lab-a").textContent = co ? "Node column (who / what becomes a node)" : "Source node column";
     $("#lab-b").textContent = co ? "Group column (what they share)" : "Target node column";
     $("#dir-row").style.display = co ? "none" : "";
+    syncWeightUI();
     // whichever mode is picked, the two selects must not sit on the same column
     if ($("#m-a").value === $("#m-b").value) {
       const guess = !co ? detectEdgePair(F) : null;
@@ -1493,6 +1564,24 @@ function openAttrMapper() {
 /* ========================================================= GRAPH BUILD === */
 const normKey = s => String(s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 
+/* Weighting by the value of a text column ("signs" = 1, "appears" = 2). */
+const CAT_MAX = 60;                  // more distinct values than this is not a category
+const CAT_BLANK = "(blank)";
+const catKey = v => String(v ?? "").trim() || CAT_BLANK;
+const PAIR_RULE_TEXT = { min: "the smaller weight", mean: "the mean of the two weights",
+  max: "the larger weight", product: "the product of the two weights" };
+function pairWeight(a, b, rule) {
+  return rule === "mean" ? (a + b) / 2 : rule === "max" ? Math.max(a, b)
+    : rule === "product" ? a * b : Math.min(a, b);
+}
+function weightDescription() {
+  const m = S.map;
+  if (m.weightCol === "__cat__")
+    return `by the value of "${m.weightCat}" (` + Object.entries(m.weightValues || {})
+      .map(([v, w]) => `${v} = ${w}`).join(", ") + `)`;
+  return `by "${m.weightCol}"`;
+}
+
 function build() {
   busy(true, "Building the network…");
   const m = S.map, rows = S.raw.rows;
@@ -1519,6 +1608,7 @@ function build() {
   let badWeights = 0;
   const wOf = row => {
     if (m.weightCol === "__count__") return 1;
+    if (m.weightCol === "__cat__") return m.weightValues[catKey(row[m.weightCat])] ?? 1;
     const v = parseFloat(row[m.weightCol]);
     if (!Number.isFinite(v)) { badWeights++; return 0; }
     return v;
@@ -1563,15 +1653,19 @@ function build() {
     }
     let pairCount = 0;
     for (const [gv, members] of groups) {
-      // de-duplicate a person appearing twice in the same group
+      // de-duplicate a person appearing twice in the same group; when rows carry
+      // weights, keep the row that weighs most (a witness who is also the agent)
       const seen = new Map();
-      for (const mem of members) if (!seen.has(mem.node.id)) seen.set(mem.node.id, mem);
+      for (const mem of members) {
+        const had = seen.get(mem.node.id);
+        if (!had || (m.weightCol !== "__count__" && wOf(mem.row) > wOf(had.row))) seen.set(mem.node.id, mem);
+      }
       const list = [...seen.values()];
       pairCount += list.length * (list.length - 1) / 2;
       if (list.length > 400) continue;      // a single group that huge would blow up the graph
       for (let i = 0; i < list.length; i++)
         for (let j = i + 1; j < list.length; j++) {
-          const w = m.weightCol === "__count__" ? 1 : Math.min(wOf(list[i].row), wOf(list[j].row));
+          const w = m.weightCol === "__count__" ? 1 : pairWeight(wOf(list[i].row), wOf(list[j].row), m.pairRule);
           const L = addLink(list[i].node, list[j].node, w, list[i].row, gv);
           for (const c of m.edgeInfo) {
             const v = String(list[j].row[c] ?? "").trim();
@@ -3967,8 +4061,10 @@ function copyMethods() {
   const txt =
     `The network was built from ${S.raw.name} (${S.raw.rows.length.toLocaleString()} rows). ` +
     (S.map.mode === "co"
-      ? `Each row records the presence of a "${S.map.a}" in a "${S.map.b}"; two nodes were linked when they appear in the same "${S.map.b}", and the edge weight is the number of such shared units. `
-      : `Each row was read as an ${S.map.directed ? "directed" : "undirected"} edge between "${S.map.a}" and "${S.map.b}"${S.map.weightCol !== "__count__" ? `, weighted by "${S.map.weightCol}"` : ""}. `) +
+      ? `Each row records the presence of a "${S.map.a}" in a "${S.map.b}"; two nodes were linked when they appear in the same "${S.map.b}", and the edge weight is ` +
+        (S.map.weightCol === "__count__" ? `the number of such shared units. `
+          : `${weightDescription()}, the two rows of a pair combined by taking ${PAIR_RULE_TEXT[S.map.pairRule || "min"]}. `)
+      : `Each row was read as an ${S.map.directed ? "directed" : "undirected"} edge between "${S.map.a}" and "${S.map.b}"${S.map.weightCol !== "__count__" ? `, weighted ${weightDescription()}` : ""}. `) +
     `The resulting graph has ${S.G.nodes.length.toLocaleString()} nodes and ${S.G.links.length.toLocaleString()} edges` +
     (st.density != null ? ` (density ${fmt(st.density, 4)}, ${st.components} connected component${st.components === 1 ? "" : "s"}, largest containing ${st.largest} nodes` +
       (st.avgPath ? `, mean shortest path ${fmt(st.avgPath, 2)}, diameter ${st.diameter}` : "") + `)` : "") + `. ` +
