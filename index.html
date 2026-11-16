@@ -874,7 +874,9 @@ const S = {
     edgeWidth: 1,
     curved: false,
     dark: false,
-    hidden: new Set()   // hidden category values (legend toggles)
+    hidden: new Set(),  // hidden category values (legend toggles)
+    edgeColorByType: true,
+    hiddenTypes: new Set() // edge types switched off in Style
   },
   tf: d3.zoomIdentity,
   sim: null,
@@ -969,6 +971,12 @@ const HELP = {
     say an "action" column — lets you type the number each value is worth (signs = 1, appears = 2), and
     every row then weighs what its value is worth. Weight drives edge thickness, the threshold slider,
     and (optionally) the distance used by betweenness and closeness.`,
+  edgetype: `<b>What kind of tie is this?</b> Pick a text column — an "action" or "relation" column —
+    and every edge remembers which values it came from. In Style you can then colour edges by type and
+    switch types off: the network, the weights and every metric are recomputed from the types left on.
+    Nothing is scored; a type is either in or out. In co-occurrence mode an edge joins two rows, so its
+    type is the pair of their values ("signs + sues"), and switching a value off removes every tie that
+    rests on it.`,
   pairrule: `<b>Two people, two weights, one edge.</b> In a co-occurrence table each row carries its own
     weight, but an edge joins two rows — the two people in the same group. This picks the edge's weight
     from theirs: the smaller (a tie is only as strong as its weaker side), the average, the larger, or
@@ -1426,6 +1434,15 @@ function openMapper() {
         <p class="hint">Every row weighs what its value is worth. A value set to 0 adds nothing to an edge.</p>
       </div>
 
+      <div class="row">
+        <label>Edge type (optional)${helpChip("edgetype")}</label>
+        <select id="m-et">
+          <option value="">None — all edges are one kind</option>
+          ${Object.keys(catValues).map(f => `<option value="${esc(f)}" ${prev.edgeTypeCol === f ? "selected" : ""}>Type each edge by “${esc(f)}”</option>`).join("")}
+        </select>
+        <p class="hint">Lets you colour edges by kind and switch kinds on and off in Style, instead of giving them scores.</p>
+      </div>
+
       <div class="row" id="pair-row" style="display:none">
         <label>Combine the two people's weights${helpChip("pairrule")}</label>
         <select id="m-pair">
@@ -1478,6 +1495,7 @@ function openMapper() {
         weightCol: isCat ? "__cat__" : wv, agg: $("#m-agg").value,
         weightCat: isCat ? wv.slice(4) : null, weightValues: isCat ? weightValues : null,
         pairRule: $("#m-pair").value,
+        edgeTypeCol: $("#m-et").value || null,
         directed: $("#m-dir").checked,
         nodeInfo: $$("#m-nodeinfo input:checked").map(i => i.value),
         edgeInfo: $$("#m-edgeinfo input:checked").map(i => i.value),
@@ -1574,6 +1592,50 @@ function pairWeight(a, b, rule) {
   return rule === "mean" ? (a + b) / 2 : rule === "max" ? Math.max(a, b)
     : rule === "product" ? a * b : Math.min(a, b);
 }
+function aggregate(a, rule) {
+  return rule === "sum" ? a.reduce((x, y) => x + y, 0)
+    : rule === "max" ? maxOf(a)
+      : rule === "mean" ? a.reduce((x, y) => x + y, 0) / a.length
+        : a[0];
+}
+
+/* Edge types: switch kinds of tie on and off instead of scoring them. A part
+   is one row (edge list) or one pair of people in one group (co-occurrence),
+   stored as one list of values per side — a person can carry several values
+   in the same group (sues and promises). It stays in while every side keeps at
+   least one value switched on; an edge's weight is then rebuilt from the parts
+   left, with the same merge rule as at build time. */
+const onVals = side => side.filter(v => !S.view.hiddenTypes.has(v));
+function partOn(p) { return p.t.every(side => onVals(side).length > 0); }
+const partLabel = p => p.t.map(side => onVals(side).join("/") || side.join("/")).join(" + ");
+function applyTypeFilter() {
+  if (!S.G) return;
+  const off = S.view.hiddenTypes.size > 0;
+  for (const L of S.G.links) {
+    if (!L.parts || !off) { L.w = L.wAll; L.typeOff = false; continue; }
+    const on = L.parts.filter(partOn);
+    L.typeOff = !on.length;
+    L.w = on.length ? aggregate(on.map(p => p.w), S.map.agg) : 0;
+  }
+  indexGraph();                      // degree and strength follow the new weights
+  computeBasics();
+  S.stats = null;
+}
+const MIXED = "#9aa3af";
+function linkColour(L) {
+  const V = S.view;
+  const plain = V.dark ? "#8fa3bd" : "#6f7d90";
+  if (!L.parts || !V.edgeColorByType) return plain;
+  // one colour only when every visible part rests on the same single value
+  // (signs + signs); anything else is a mixed edge
+  const vals = new Set(L.parts.filter(partOn).flatMap(p => p.t.flatMap(onVals)));
+  return vals.size === 1 ? (S.typePalette[[...vals][0]] || plain) : MIXED;
+}
+function typeSummary(L, all) {
+  const c = new Map();
+  for (const p of all ? L.parts : L.parts.filter(partOn)) { const k = partLabel(p); c.set(k, (c.get(k) || 0) + 1); }
+  return [...c.entries()].sort((a, b) => b[1] - a[1]).map(([k, n]) => n > 1 ? `${k} ×${n}` : k).join("; ");
+}
 function weightDescription() {
   const m = S.map;
   if (m.weightCol === "__cat__")
@@ -1614,16 +1676,18 @@ function build() {
     return v;
   };
 
-  const addLink = (na, nb, w, row, group) => {
+  const tOf = row => catKey(row[m.edgeTypeCol]);
+  const addLink = (na, nb, w, row, group, types) => {
     let s = na.id, t = nb.id;
     if (!(m.mode === "edges" && m.directed) && s > t) { const x = s; s = t; t = x; }
     const key = s + " " + t;
     let L = linkMap.get(key);
     if (!L) {
-      L = { s, t, w: 0, n: 0, _w: [], info: {}, groups: [] };
+      L = { s, t, w: 0, n: 0, _w: [], info: {}, groups: [], parts: [] };
       linkMap.set(key, L);
     }
     L.n++; L._w.push(w);
+    if (types) L.parts.push({ w, t: types });
     if (group != null) L.groups.push(group);
     if (row) for (const c of m.edgeInfo) {
       const v = String(row[c] ?? "").trim();
@@ -1638,7 +1702,7 @@ function build() {
       if (!av || !bv || normKey(av) === normKey(bv)) continue;   // skip blanks and self-loops
       const na = getNode(av), nb = getNode(bv);
       noteInfo(na, r); noteInfo(nb, r);
-      addLink(na, nb, wOf(r), r, null);
+      addLink(na, nb, wOf(r), r, null, m.edgeTypeCol ? [[tOf(r)]] : null);
     }
   } else {
     // two-mode: bucket rows by group, then connect every pair inside a bucket
@@ -1655,10 +1719,11 @@ function build() {
     for (const [gv, members] of groups) {
       // de-duplicate a person appearing twice in the same group; when rows carry
       // weights, keep the row that weighs most (a witness who is also the agent)
-      const seen = new Map();
+      const seen = new Map(), typesIn = new Map();   // every value a person carries in this group
       for (const mem of members) {
         const had = seen.get(mem.node.id);
         if (!had || (m.weightCol !== "__count__" && wOf(mem.row) > wOf(had.row))) seen.set(mem.node.id, mem);
+        if (m.edgeTypeCol) (typesIn.get(mem.node.id) || typesIn.set(mem.node.id, new Set()).get(mem.node.id)).add(tOf(mem.row));
       }
       const list = [...seen.values()];
       pairCount += list.length * (list.length - 1) / 2;
@@ -1666,7 +1731,8 @@ function build() {
       for (let i = 0; i < list.length; i++)
         for (let j = i + 1; j < list.length; j++) {
           const w = m.weightCol === "__count__" ? 1 : pairWeight(wOf(list[i].row), wOf(list[j].row), m.pairRule);
-          const L = addLink(list[i].node, list[j].node, w, list[i].row, gv);
+          const L = addLink(list[i].node, list[j].node, w, list[i].row, gv,
+            m.edgeTypeCol ? [[...typesIn.get(list[i].node.id)].sort(), [...typesIn.get(list[j].node.id)].sort()] : null);
           for (const c of m.edgeInfo) {
             const v = String(list[j].row[c] ?? "").trim();
             if (v && (L.info[c] ||= []).length < 40 && !L.info[c].includes(v)) L.info[c].push(v);
@@ -1678,13 +1744,18 @@ function build() {
 
   // finalise weights
   for (const L of linkMap.values()) {
-    const a = L._w;
-    L.w = m.agg === "sum" ? a.reduce((x, y) => x + y, 0)
-      : m.agg === "max" ? maxOf(a)
-        : m.agg === "mean" ? a.reduce((x, y) => x + y, 0) / a.length
-          : a[0];
+    L.w = L.wAll = aggregate(L._w, m.agg);
     delete L._w;
+    if (!m.edgeTypeCol) delete L.parts;
   }
+  // edge types: how many rows carry each value, most frequent first
+  S.edgeTypes = [];
+  if (m.edgeTypeCol) {
+    const c = new Map();
+    for (const r of rows) { const v = tOf(r); c.set(v, (c.get(v) || 0) + 1); }
+    S.edgeTypes = [...c.entries()].sort((x, y) => y[1] - x[1]);
+  }
+  S.typePalette = Object.fromEntries(S.edgeTypes.map(([v], i) => [v, PALETTE[i % PALETTE.length]]));
 
   // condense the most-frequent hover value per node
   for (const n of nodes.values()) {
@@ -1724,6 +1795,7 @@ function build() {
   S.rankBy = null;
   S.view.threshold = 0;
   S.view.hidden.clear();
+  S.view.hiddenTypes.clear();
   computeBasics();
   refreshSizeExtent();
   $("#empty").style.display = nodeList.length ? "none" : "flex";
@@ -2014,7 +2086,7 @@ function componentHomes(nodes) {
 function visibleLinks() {
   const th = S.view.threshold;
   const only = S.view.onlyPicked && S.picked.size;
-  return S.G.links.filter(l => l.w >= th && !isHidden(l.source) && !isHidden(l.target) &&
+  return S.G.links.filter(l => !l.typeOff && l.w >= th && !isHidden(l.source) && !isHidden(l.target) &&
     (!only || (S.picked.has(l.s) && S.picked.has(l.t))));
 }
 function visibleNodes() {
@@ -2151,7 +2223,7 @@ function paint(ctx, k) {
     const dim = ego && !(ego.has(L.s) && ego.has(L.t));
     const hot = S.hoverLink === L;
     ctx.globalAlpha = hot ? .95 : dim ? V.edgeOpacity * .12 : V.edgeOpacity;
-    ctx.strokeStyle = hot ? "#e4572e" : (V.dark ? "#8fa3bd" : "#6f7d90");
+    ctx.strokeStyle = hot ? "#e4572e" : linkColour(L);
     ctx.lineWidth = ((0.35 + 2.4 * Math.sqrt(L.w / maxW)) * V.edgeWidth) / Math.max(k, .35);
     ctx.beginPath();
     ctx.moveTo(L.source.x, L.source.y);
@@ -2444,6 +2516,7 @@ function nodeTip(d) {
 }
 function linkTip(L) {
   const rows = [["Weight", fmt(L.w)], ["Rows behind it", L.n]];
+  if (L.parts) rows.push(["Type", typeSummary(L, false)]);
   if (L.groups?.length) rows.push([S.map.b, L.groups.slice(0, 8).join("; ") + (L.groups.length > 8 ? ` …(+${L.groups.length - 8})` : "")]);
   for (const k in L.info) if (!L.groups?.length || k !== S.map.b)
     rows.push([k, L.info[k].slice(0, 8).join("; ") + (L.info[k].length > 8 ? " …" : "")]);
@@ -3088,6 +3161,20 @@ function renderStylePanel() {
     <label class="chk"><input type="checkbox" id="s-hideiso" ${V.hideIsolates ? "checked" : ""}>
       <span>Hide nodes left with no visible edges</span></label>
   </div>
+  ${S.map.edgeTypeCol ? `
+  <div class="sect">
+    <h3>Edge types: “${esc(S.map.edgeTypeCol)}”${helpChip("edgetype")}</h3>
+    <label class="chk"><input type="checkbox" id="s-ecol" ${V.edgeColorByType ? "checked" : ""}>
+      <span>Colour edges by type (grey = an edge resting on more than one type)</span></label>
+    <div class="scrollbox" id="s-types" style="max-height:240px;margin-top:6px">
+      ${S.edgeTypes.map(([v, n]) => `<label class="chk"><input type="checkbox" value="${esc(v)}" ${V.hiddenTypes.has(v) ? "" : "checked"}>
+        <span class="swatch" style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${S.typePalette[v]};margin:0 2px"></span>
+        <span style="flex:1">${esc(v)}</span><span class="hint" style="margin:0">${n}</span></label>`).join("")}
+    </div>
+    <div class="btnrow"><button class="btn sm" id="s-tall">All on</button><button class="btn sm" id="s-tnone">All off</button></div>
+    <p class="hint">Switching a type off removes the ties that rest on it and rebuilds the weights from what is left.
+      Recompute metrics in Analysis afterwards.</p>
+  </div>` : ""}
 
   <div class="sect">
     <h3>Colour${helpChip("colour")}</h3>
@@ -3189,6 +3276,18 @@ function renderStylePanel() {
   });
   on("#s-th", "change", () => { if (V.layout === "force" || V.layout === "communities") runLayout(V.layout); });
   on("#s-hideiso", "change", e => { V.hideIsolates = e.target.checked; renderStatus(); draw(); });
+  const typesChanged = () => {
+    applyTypeFilter();
+    const o = $("#s-thout"); if (o) o.textContent = visibleLinks().length.toLocaleString() + " edges";
+    renderStatus(); draw();
+  };
+  $$("#s-types input").forEach(i => i.onchange = () => {
+    i.checked ? V.hiddenTypes.delete(i.value) : V.hiddenTypes.add(i.value);
+    typesChanged();
+  });
+  on("#s-ecol", "change", e => { V.edgeColorByType = e.target.checked; draw(); });
+  on("#s-tall", "click", () => { V.hiddenTypes.clear(); renderStylePanel(); typesChanged(); });
+  on("#s-tnone", "click", () => { S.edgeTypes.forEach(([v]) => V.hiddenTypes.add(v)); renderStylePanel(); typesChanged(); });
   on("#s-color", "change", e => { V.colorBy = e.target.value; applyColours(); V.hidden.clear(); renderLegend(); draw(); });
   on("#s-size", "change", e => { V.sizeBy = e.target.value; draw(); });
   on("#s-scale", "input", e => { V.sizeScale = +e.target.value; e.target.nextElementSibling.textContent = V.sizeScale + "×"; draw(); });
@@ -3779,9 +3878,9 @@ function exportSVG() {
     const x1 = X(L.source), y1 = Y(L.source), x2 = X(L.target), y2 = Y(L.target);
     if (V.curved) {
       const mx = (x1 + x2) / 2, my = (y1 + y2) / 2, dx = x2 - x1, dy = y2 - y1;
-      out.push(`<path d="M${x1.toFixed(1)},${y1.toFixed(1)} Q${(mx - dy * .12).toFixed(1)},${(my + dx * .12).toFixed(1)} ${x2.toFixed(1)},${y2.toFixed(1)}" stroke-width="${sw.toFixed(2)}" opacity="${op.toFixed(3)}"/>`);
+      out.push(`<path d="M${x1.toFixed(1)},${y1.toFixed(1)} Q${(mx - dy * .12).toFixed(1)},${(my + dx * .12).toFixed(1)} ${x2.toFixed(1)},${y2.toFixed(1)}" stroke="${linkColour(L)}" stroke-width="${sw.toFixed(2)}" opacity="${op.toFixed(3)}"/>`);
     } else {
-      out.push(`<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke-width="${sw.toFixed(2)}" opacity="${op.toFixed(3)}"/>`);
+      out.push(`<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="${linkColour(L)}" stroke-width="${sw.toFixed(2)}" opacity="${op.toFixed(3)}"/>`);
     }
   }
   out.push(`</g><g id="nodes" stroke="${V.dark ? "rgba(255,255,255,.35)" : "#ffffff"}" stroke-width="0.9">`);
@@ -3830,9 +3929,11 @@ function exportNodesCSV() {
 }
 function exportEdgesCSV() {
   const infoCols = [...new Set(S.G.links.flatMap(l => Object.keys(l.info || {})))];
-  const cols = ["source", "target", "weight", "rows", ...(S.map.mode === "co" ? ["shared"] : []), ...infoCols];
-  const rows = S.G.links.map(L => {
+  const cols = ["source", "target", "weight", "rows", ...(S.map.edgeTypeCol ? ["types"] : []),
+    ...(S.map.mode === "co" ? ["shared"] : []), ...infoCols];
+  const rows = visibleLinks().map(L => {
     const o = { source: L.source.label, target: L.target.label, weight: L.w, rows: L.n };
+    if (L.parts) o.types = typeSummary(L, true);
     if (S.map.mode === "co") o.shared = (L.groups || []).join(" | ");
     for (const c of infoCols) o[c] = (L.info[c] || []).join(" | ");
     return o;
@@ -4009,7 +4110,7 @@ function saveSession() {
   const payload = {
     format: "network-explorer/session", version: 1, saved: new Date().toISOString(),
     source: S.raw.name, map: S.map,
-    view: { ...S.view, hidden: [...S.view.hidden] },
+    view: { ...S.view, hidden: [...S.view.hidden], hiddenTypes: [...S.view.hiddenTypes] },
     transform: { x: S.tf.x, y: S.tf.y, k: S.tf.k },
     metricsDone: [...S.metricsDone],
     picked: [...S.picked],
@@ -4043,7 +4144,8 @@ function loadSession(file) {
     S.metricsDone = new Set(d.metricsDone || ["degree", "strength"]);
     S.picked = new Set(d.picked || []);
     S.modularity = d.modularity; S.communityCount = d.communityCount; S.stats = d.stats;
-    S.view = { ...S.view, ...d.view, hidden: new Set(d.view.hidden || []) };
+    S.view = { ...S.view, ...d.view, hidden: new Set(d.view.hidden || []), hiddenTypes: new Set(d.view.hiddenTypes || []) };
+    applyTypeFilter();
     S.autoFit = false;                  // the saved transform is the one we want
     if (S.sim) { S.sim.stop(); S.sim = null; }
     refreshSizeExtent(); applyColours();
@@ -4072,6 +4174,8 @@ function copyMethods() {
       (S.useWeights ? ", using edge weights as inverse distances" : ", unweighted") + `. ` : "") +
     (S.metricsDone.has("community") ? `Communities were detected with the Louvain method (${S.communityCount} communities, modularity Q = ${fmt(S.modularity, 3)}). ` : "") +
     (S.view.threshold > 0 ? `Edges with a weight below ${fmt(S.view.threshold)} are hidden in the figure. ` : "") +
+    (S.map.edgeTypeCol ? `Edges are typed by "${S.map.edgeTypeCol}"` + (S.view.hiddenTypes.size
+      ? `; ties resting on ${[...S.view.hiddenTypes].map(v => `"${v}"`).join(", ")} are excluded from the network and its measures. ` : ". ") : "") +
     `Layout: ${S.view.layout === "circle" ? "circular, ordered by centrality" : S.view.layout === "grid" ? "clustered by category" : "force-directed"}. ` +
     `Analysis and figure produced with Network Explorer.`;
   navigator.clipboard?.writeText(txt).then(

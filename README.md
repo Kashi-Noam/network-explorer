@@ -41,6 +41,17 @@ weight, so you also choose how they combine: the smaller, the average, the
 larger, or the product. The choice is saved in the session file and written
 into the methods note.
 
+Instead of scoring kinds of tie, you can also **type** the edges. Choose an
+"Edge type" column in the dialog (an `action` or `relation` column) and the
+Style tab lists its values with a colour and a checkbox each. Edges are drawn in
+the colour of their type (grey when an edge rests on more than one), and
+switching a type off removes the ties that rest on it: the weights, the
+threshold slider and every metric are rebuilt from the types left on. In
+co-occurrence mode a tie joins two people in one group, so it survives as long
+as each of them still carries a value that is switched on — turning `signs`
+off leaves the plaintiff and the defendant of a deed connected, and drops the
+ties that exist only because someone signed.
+
 **3 · Draws the network.** Scroll to zoom, drag to pan, drag a node to pin it in
 place, double-click to release it. Click a node to light up its ego network and
 dim everything else. Search by name. Four layouts: force-directed, force grouped
